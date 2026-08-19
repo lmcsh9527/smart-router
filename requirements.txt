@@ -1,0 +1,7 @@
+# TokenSaver 网关运行依赖
+# 运行环境：opensquilla uv tool venv（/Users/hui/.local/share/uv/tools/opensquilla）
+# 安装：/Users/hui/.local/bin/uv pip install --python <opensquilla-python> -r requirements.txt
+
+fastapi>=0.128
+uvicorn>=0.39
+httpx>=0.28

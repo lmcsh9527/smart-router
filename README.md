@@ -35,6 +35,29 @@ curl -N http://localhost:20130/v1/chat/completions \
 
 给 DSH / Hermes 配置：`base_url=http://localhost:20130/v1`，模型填 `auto`。
 
+## 降级策略（可用性保障）
+
+高档模型（如 pro）推理慢或上游不稳定时，网关按降级链自动降级，保证请求能出结果：
+
+```
+jy/deepseek-v4-pro → jy/deepseek-v4-flash-0731 → jy/deepseek-v4-flash
+jy/deepseek-v4-flash-0731 → jy/deepseek-v4-flash
+```
+
+- 触发条件：连接失败 / 上游 5xx / 首字节等待超时（默认 90s，`ROUTER_UPSTREAM_READ_TIMEOUT` 可调）。
+- 降级后响应 `x_tokensaver` 里 `upstream_model` 是实际使用模型，另有 `degraded_from` 记录原始判定模型；日志打 `ROUTE_DEGRADED`。
+- 流式一旦开始输出不降级（只能透传）。
+
+## 实测验证（2026-08-19）
+
+| 场景 | 请求 | 路由结果 | 响应 |
+|---|---|---|---|
+| 简单 | `1+1等于几` | c0 → `jy/deepseek-v4-flash` | 200，`content="2。"` |
+| 复杂 | `设计分布式任务调度系统架构` + `max_tokens:200` | c3 → `jy/deepseek-v4-pro` | 200，返回架构设计（~11s） |
+| 流式 | `用一句话解释什么是路由网关` + `stream:true` | c0 → `jy/deepseek-v4-flash` | 200，SSE 129 行 chunk |
+
+> 注：9router 的 pro 模型无 max_tokens 时推理很长（>90s 首字节），网关会触发降级链；这是上游行为，非网关缺陷。
+
 ## 架构
 
 ```
