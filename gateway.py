@@ -32,23 +32,30 @@ from opensquilla.squilla_router.v4_phase3 import V4Phase3Strategy
 LISTEN_HOST = os.getenv("TOKENSAVER_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.getenv("TOKENSAVER_PORT", "20130"))
 UPSTREAM_BASE = os.getenv("ROUTER_UPSTREAM_URL", "http://localhost:20128/v1").rstrip("/")
-UPSTREAM_KEY = os.getenv("ROUTER_UPSTREAM_KEY", "sk-8f1a75766b63858d-y4witj-bcf8227b")
+UPSTREAM_KEY = os.getenv("ROUTER_UPSTREAM_KEY", "sk-your-9router-key")
 UPSTREAM_TIMEOUT = float(os.getenv("ROUTER_UPSTREAM_TIMEOUT", "600"))
 # 首字节等待超时：高档模型推理慢，超时后降级到低档，保证请求能出结果
 UPSTREAM_READ_TIMEOUT = float(os.getenv("ROUTER_UPSTREAM_READ_TIMEOUT", "90"))
 
-# 档位 → 9router 模型（任务给定映射）
+# 档位 → 9router 模型（智能路由映射）
+# 原则：c0-c2 用机缘付费（稳定），c3 最复杂任务走免费渠道省成本
 TIER_MODEL_MAP: dict[str, str] = {
-    "c0": "jy/deepseek-v4-flash",
-    "c1": "jy/deepseek-v4-flash",
-    "c2": "jy/deepseek-v4-flash-0731",
-    "c3": "jy/deepseek-v4-pro",
+    "c0": "jy/deepseek-v4-flash",          # 最简单 → 最便宜
+    "c1": "jy/deepseek-v4-flash-0731",      # 简单 → 稍强一点
+    "c2": "jy/deepseek-v4-pro",             # 中等 → 主力强模型
+    "c3": "zhipu/glm-5",                    # 最复杂 → 免费强模型（智谱）
 }
 VALID_TIERS: list[str] = ["c0", "c1", "c2", "c3"]
 DEFAULT_TIER = "c1"
 
 # 降级链：高档模型连接/响应超时 → 依次降级到低档，保证可用性
 MODEL_FALLBACK_CHAIN: dict[str, list[str]] = {
+    "zhipu/glm-5": [
+        "zhipu/glm-5",
+        "jy/deepseek-v4-pro",
+        "jy/deepseek-v4-flash-0731",
+        "jy/deepseek-v4-flash",
+    ],
     "jy/deepseek-v4-pro": [
         "jy/deepseek-v4-pro",
         "jy/deepseek-v4-flash-0731",
@@ -94,6 +101,23 @@ async def get_strategy() -> V4Phase3Strategy:
 
 def pick_model(tier: str) -> str:
     return TIER_MODEL_MAP.get(tier, TIER_MODEL_MAP[DEFAULT_TIER])
+
+
+# 升级词：用户明示要"最好/最强/最高"能力时，强制路由到最高档（c3→pro）
+_UPGRADE_HINTS = [
+    "最好的模型", "最强模型", "最高能力", "最高思考", "拿出你最高的", "拿出你最强",
+    "用最好的模型", "用最强", "深度思考", "深度分析", "最高水平", "全力以赴",
+    "best model", "strongest", "deepest thinking", "maximum effort", "use the best",
+]
+
+def _apply_upgrade_hint(text: str, tier: str) -> str:
+    """用户明示要最强模型时，把 tier 强制升到 c3。"""
+    if not text:
+        return tier
+    low = text.lower()
+    if any(hint in low for hint in _UPGRADE_HINTS):
+        return "c3"
+    return tier
 
 
 def last_user_text(messages: list[dict]) -> str:
@@ -200,6 +224,8 @@ async def chat_completions(request: Request) -> Any:
             )
         else:
             tier, confidence, source, extra = DEFAULT_TIER, 0.0, "empty", {}
+        # 升级词检测：用户明示要最强/最好模型时，强制走最高档（尊重用户意图）
+        tier = _apply_upgrade_hint(text, tier)
         upstream_model = pick_model(tier)
         route_info = {
             "tier": tier,

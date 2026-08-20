@@ -27,7 +27,7 @@ MVP 阶段以手动实测为主：
 
 ```bash
 # classify 最小验证
-/Users/hui/.local/share/uv/tools/opensquilla/bin/python minimal_classify_test.py
+python3 minimal_classify_test.py
 
 # 网关冒烟
 curl http://localhost:20130/v1/chat/completions \

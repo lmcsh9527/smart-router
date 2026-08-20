@@ -5,13 +5,13 @@
 网关必须跑在 opensquilla venv 里（它才有 opensquilla 包）：
 
 ```bash
-/Users/hui/.local/share/uv/tools/opensquilla/bin/python -m pip list  # 确认 fastapi
+python3 -m pip list  # 确认 fastapi
 ```
 
 安装 fastapi（国内网络建议镜像）：
 
 ```bash
-/Users/hui/.local/bin/uv pip install --python /Users/hui/.local/share/uv/tools/opensquilla/bin/python fastapi \
+uv pip install --python "$(which python3)" fastapi \
   -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
