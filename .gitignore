@@ -29,3 +29,10 @@ env/
 *.swp
 gateway.pid
 gateway.log
+
+# TokenSaver 运行时敏感数据（含 API key，绝不入库）
+jy_api_key
+qz_api_key
+models_pool.json
+providers.json
+*.bak-*

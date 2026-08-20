@@ -1,0 +1,13 @@
+{
+  "providers": [
+    {
+      "id": "p-example",
+      "name": "示例供应商",
+      "base_url": "https://your-provider.example/v1",
+      "api_key_file": "your_api_key",
+      "api_key": "",
+      "note": "示例：把 API key 写入项目目录 your_api_key 文件（600 权限）",
+      "created_at": "2026-08-20 00:00:00"
+    }
+  ]
+}

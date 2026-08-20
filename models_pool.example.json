@@ -1,0 +1,36 @@
+{
+  "models": [
+    {
+      "id": "example-flash",
+      "name": "示例-轻量模型",
+      "base_url": "https://your-provider.example/v1",
+      "api_key_file": "your_api_key",
+      "api_key": "",
+      "model": "your-flash-model",
+      "model_type": "text",
+      "context_window": 1000000,
+      "tiers": ["c0", "c1"],
+      "priority": 1,
+      "enabled": true,
+      "note": "简单任务模型",
+      "provider_id": "",
+      "last_test": null
+    },
+    {
+      "id": "example-pro",
+      "name": "示例-强模型",
+      "base_url": "https://your-provider.example/v1",
+      "api_key_file": "your_api_key",
+      "api_key": "",
+      "model": "your-pro-model",
+      "model_type": "text",
+      "context_window": 1000000,
+      "tiers": ["c2", "c3"],
+      "priority": 1,
+      "enabled": true,
+      "note": "复杂任务模型",
+      "provider_id": "",
+      "last_test": null
+    }
+  ]
+}
