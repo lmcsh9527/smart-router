@@ -2281,7 +2281,6 @@ async function sendFeedback(decisionId, sessionKey, turnIndex, rating, btnEl){
   try {
     const r = await api('/admin/api/selflearning/feedback', {method:'POST', body:JSON.stringify({decision_id:decisionId, session_key:sessionKey, turn_index:parseInt(turnIndex||0,10), rating})});
     if (btnEl) btnEl.innerHTML = '<span class="tag">✓已记录</span>';
-    if (r && r.ok) await refreshUsage();
   } catch(e){ alert('纠错失败: '+e.message); }
 }
 async function slTrain(){
