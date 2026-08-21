@@ -125,7 +125,7 @@
         "c0"
       ],
       "priority": 100,
-      "enabled": true,
+      "enabled": false,
       "note": "openai",
       "provider_id": "p-99eef52418",
       "last_test": {
@@ -252,7 +252,8 @@
         "detail": "回复正常：'2'",
         "content": "2",
         "model_type": "text"
-      }
+      },
+      "price_cached": 0.3
     },
     {
       "id": "sensenova-6.8-flash-lite",
