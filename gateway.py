@@ -559,13 +559,34 @@ def last_user_text(messages: list[dict]) -> str:
     return ""
 
 
+_TOOL_IMAGE_MARKERS = ("attached image", "tool result", "tool image")
+
+
+def _is_tool_image_msg(msg: dict) -> bool:
+    """识别 DSH/客户端注入的工具图片消息（如 read_image 结果 'Attached image(s) from tool'）。
+    这类图是给文本模型看的工具回传，不是用户主动发图，不应触发识图路由。"""
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        low = content.lower()
+    elif isinstance(content, list):
+        low = " ".join(
+            str(seg.get("text", "")) for seg in content if isinstance(seg, dict)
+        ).lower()
+    else:
+        low = ""
+    return any(m in low for m in _TOOL_IMAGE_MARKERS)
+
+
 def has_new_image(messages: list[dict]) -> bool:
     """只检测【当前轮】（最新一条 user 消息）是否含图片——决定是否走识图模型。
-    历史回合里的旧图不再影响路由（避免长上下文因残留截图被全走识图模型）。"""
+    跳过工具注入图片（read_image 等），继续往前找真正的用户消息。"""
     for msg in reversed(messages or []):
         if not isinstance(msg, dict):
             continue
         if msg.get("role") != "user":
+            continue
+        if _is_tool_image_msg(msg):
+            # 工具回传图不算用户发图，继续往前找
             continue
         content = msg.get("content", "")
         if isinstance(content, list):
