@@ -435,9 +435,15 @@ async def get_strategy() -> V4Phase3Strategy:
                 bundle_dir = _resolve_active_bundle_dir()
                 logger.info("loading V4Phase3Strategy ... bundle=%s", bundle_dir or "baseline(default)")
                 if bundle_dir:
-                    _strategy = await asyncio.to_thread(V4Phase3Strategy, bundle_dir=bundle_dir)
+                    _strategy = await asyncio.to_thread(
+                        V4Phase3Strategy, bundle_dir=bundle_dir,
+                        emit_train_features=True, emit_raw_bge=True,
+                    )
                 else:
-                    _strategy = await asyncio.to_thread(V4Phase3Strategy)
+                    _strategy = await asyncio.to_thread(
+                        V4Phase3Strategy,
+                        emit_train_features=True, emit_raw_bge=True,
+                    )
                 logger.info(
                     "V4Phase3Strategy ready | bundle=%s available=%s version=%s",
                     _strategy.bundle_dir,
