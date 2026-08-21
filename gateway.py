@@ -534,7 +534,7 @@ def _body_text_summary(body_bytes: bytes, limit: int = 50) -> str:
 
 @app.middleware("http")
 async def log_calls_middleware(request: Request, call_next):
-    """记录 /v1/chat/completions 调用：时间/状态/耗时/档位/模型/来源/文本摘要。"""
+    """记录 /v1/chat/completions 调用：时间/状态/耗时/档位/模型/来源/文本摘要/Token/费用。"""
     if request.url.path != "/v1/chat/completions":
         return await call_next(request)
     body_bytes = b""
@@ -544,19 +544,34 @@ async def log_calls_middleware(request: Request, call_next):
         pass
     text = _body_text_summary(body_bytes)
     start = time.time()
+    entry = {
+        "time": time.strftime("%H:%M:%S"),
+        "status": 0,
+        "elapsed_s": 0.0,
+        "tier": "",
+        "model": "",
+        "source": "",
+        "provider": "",
+        "degraded": False,
+        "text": text,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "tokens_total": 0,
+        "cost": 0.0,
+        "cost_known": False,  # 模型配置了价格才算得出费用
+    }
+    request.state.call_entry = entry
     response = await call_next(request)
     elapsed = round(time.time() - start, 3)
-    CALL_LOG.appendleft({
-        "time": time.strftime("%H:%M:%S"),
-        "status": response.status_code,
-        "elapsed_s": elapsed,
-        "tier": response.headers.get("X-TokenSaver-Tier", ""),
-        "model": response.headers.get("X-TokenSaver-Upstream-Model", ""),
-        "source": response.headers.get("X-TokenSaver-Source", ""),
-        "provider": response.headers.get("X-TokenSaver-Provider", ""),
-        "degraded": response.headers.get("X-TokenSaver-Degraded", "") == "1",
-        "text": text,
-    })
+    entry["elapsed_s"] = elapsed
+    entry["status"] = response.status_code
+    entry["tier"] = response.headers.get("X-TokenSaver-Tier", "")
+    entry["model"] = response.headers.get("X-TokenSaver-Upstream-Model", "")
+    entry["source"] = response.headers.get("X-TokenSaver-Source", "")
+    entry["provider"] = response.headers.get("X-TokenSaver-Provider", "")
+    entry["degraded"] = response.headers.get("X-TokenSaver-Degraded", "") == "1"
+    CALL_LOG.appendleft(entry)
+    return response
     return response
 
 
@@ -565,6 +580,12 @@ def _p95(sorted_vals: list[float]) -> float:
         return 0.0
     idx = max(0, min(len(sorted_vals) - 1, int(len(sorted_vals) * 0.95)))
     return round(sorted_vals[idx], 3)
+
+
+def _is_high_end_model(model: str) -> bool:
+    """粗略判断高档模型（费用贵）：模型名含 pro/think/reason/max/ultra/plus。"""
+    m = (model or "").lower()
+    return any(k in m for k in ["pro", "think", "reason", "max", "ultra", "plus"])
 
 
 @app.get("/admin/api/usage")
@@ -591,10 +612,25 @@ async def admin_usage() -> dict:
         pass
     fail_calls = [c for c in calls if c["status"] != 200][:10]
     degraded_calls = [c for c in calls if c.get("degraded")][:10]
+    # 浪费告警：判档简单（c0/c1）却走了高档模型（可能是升级词误触/配置问题）
+    waste_calls = [
+        c for c in calls
+        if c["status"] == 200 and c.get("tier") in ("c0", "c1") and _is_high_end_model(c.get("model"))
+    ][:10]
+    total_tokens = sum(c.get("tokens_total") or 0 for c in calls)
+    total_cost = sum(c.get("cost") or 0 for c in calls)
+    cost_known = any(c.get("cost_known") for c in calls)
+    # 费用按模型分布
+    by_model_cost: dict[str, float] = {}
+    for c in calls:
+        if c.get("cost"):
+            m = c.get("model") or "?"
+            by_model_cost[m] = round(by_model_cost.get(m, 0) + c.get("cost", 0), 6)
     return {
         "calls": calls[:50],
         "fail_calls": fail_calls,
         "degraded_calls": degraded_calls,
+        "waste_calls": waste_calls,
         "stats": {
             "total": total,
             "ok": ok,
@@ -605,8 +641,13 @@ async def admin_usage() -> dict:
             "by_model": by_model,
             "by_tier": by_tier,
             "by_provider": by_provider,
+            "by_model_cost": by_model_cost,
             "fail_count": len(fail_calls),
             "degraded_count": len(degraded_calls),
+            "waste_count": len(waste_calls),
+            "total_tokens": total_tokens,
+            "total_cost": total_cost,
+            "cost_known": cost_known,
         },
     }
 
@@ -667,6 +708,8 @@ async def admin_add_pool(body: dict) -> dict:
         "model": (body.get("model") or "").strip(),
         "model_type": (body.get("model_type") or "").strip() or infer_model_type(body.get("model") or ""),
         "context_window": (body.get("context_window") or infer_context_window(body.get("model") or "") or ""),
+        "price_in": float(body.get("price_in") or 0) if (body.get("price_in") not in (None, "")) else 0.0,
+        "price_out": float(body.get("price_out") or 0) if (body.get("price_out") not in (None, "")) else 0.0,
         "tiers": tiers,
         "priority": int(body.get("priority", 100) or 100),
         "enabled": bool(body.get("enabled", True)),
@@ -688,6 +731,10 @@ async def admin_update_pool(model_id: str, body: dict) -> dict:
             for field in ("name", "base_url", "api_key_file", "api_key", "model", "note"):
                 if field in body:
                     m[field] = (body.get(field) or "").strip()
+            if "price_in" in body:
+                m["price_in"] = float(body.get("price_in") or 0) if (body.get("price_in") not in (None, "")) else 0.0
+            if "price_out" in body:
+                m["price_out"] = float(body.get("price_out") or 0) if (body.get("price_out") not in (None, "")) else 0.0
             if "tiers" in body:
                 t = body.get("tiers") or []
                 if isinstance(t, str):
@@ -1060,7 +1107,12 @@ ADMIN_HTML = r"""<!DOCTYPE html>
 body { background:var(--bg); color:var(--fg); font:14px/1.6 -apple-system,"PingFang SC",sans-serif; margin:0; padding:24px; }
 h1 { font-size:20px; margin:0 0 4px; }
 h2 { font-size:15px; margin:24px 0 8px; border-bottom:1px solid var(--line); padding-bottom:6px; }
+.card h2 { display:flex; align-items:center; justify-content:space-between; margin-top:0; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+.card.collapsed > *:not(h2) { display:none; }
+.collapse-btn { background:transparent; border:1px solid var(--line); color:var(--mut); border-radius:6px;
+  width:26px; height:24px; cursor:pointer; font-size:14px; line-height:1; flex:none; transition:all .15s; }
+.collapse-btn:hover { color:var(--fg); border-color:var(--acc); }
 .mut { color:var(--mut); font-size:12px; }
 table { width:100%; border-collapse:collapse; font-size:13px; }
 th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
@@ -1103,6 +1155,7 @@ summary { cursor:pointer; color:var(--acc); font-size:13px; }
 .dist-fill.c-model { background:linear-gradient(90deg,#4da3ff,#7b5cff); }
 .dist-fill.c-tier { background:linear-gradient(90deg,#3fb950,#4da3ff); }
 .dist-fill.c-provider { background:linear-gradient(90deg,#f0883e,#f85149); }
+.dist-fill.c-cost { background:linear-gradient(90deg,#f85149,#ff9f43); }
 .dist-val { width:30px; text-align:right; color:var(--mut); }
 /* ===== 告警 ===== */
 .alert { border-radius:10px; padding:10px 14px; margin-bottom:10px; font-size:13px; display:flex; flex-wrap:wrap; gap:6px 14px; }
@@ -1117,6 +1170,11 @@ summary { cursor:pointer; color:var(--acc); font-size:13px; }
 /* ===== 耗时着色 ===== */
 .el-mid { color:#e3b341; font-weight:600; }
 .el-slow { color:var(--err); font-weight:700; }
+/* ===== 档位 pill（可勾选） ===== */
+.tier-pill { display:inline-block; border:1px solid var(--line); background:transparent; color:var(--mut);
+  border-radius:12px; padding:1px 8px; margin:1px; font-size:11px; cursor:pointer; transition:all .15s; }
+.tier-pill:hover { border-color:var(--acc); color:var(--acc); }
+.tier-pill.on { background:var(--acc); border-color:var(--acc); color:#fff; }
 </style>
 </head>
 <body>
@@ -1154,10 +1212,12 @@ summary { cursor:pointer; color:var(--acc); font-size:13px; }
         <div><label>供应商（选填，自动带出地址/Key）</label><select id="f_provider"><option value="">＋ 新供应商</option></select></div>
         <div><label>名称 *</label><input id="f_name" placeholder="如：机缘 V4 Flash"></div>
         <div><label>Base URL *</label><input id="f_base_url" placeholder="https://tokenrhythm.studio/v1"></div>
-        <div><label>模型名 *</label><input id="f_model" placeholder="deepseek-v4-flash"></div>
+        <div><label>模型名 *（选供应商后自动列出）</label><input id="f_model" list="f_model_list" placeholder="选择或输入模型名"><datalist id="f_model_list"></datalist></div>
         <div><label>Key 文件（项目内，优先）</label><input id="f_api_key_file" placeholder="jy_api_key"></div>
         <div><label>或直接填 Key（存池文件 600）</label><input id="f_api_key" placeholder="sk-..." type="password"></div>
         <div><label>档位（逗号分隔）*</label><input id="f_tiers" placeholder="c0,c1"></div>
+        <div><label>价格 入 ¥/M</label><input id="f_price_in" type="number" step="0.01" placeholder="如 1（每百万输入 token）"></div>
+        <div><label>价格 出 ¥/M</label><input id="f_price_out" type="number" step="0.01" placeholder="如 2（每百万输出 token）"></div>
         <div><label>优先级（小优先）</label><input id="f_priority" type="number" value="100"></div>
         <div><label>备注</label><input id="f_note" placeholder="可选"></div>
       </div>
@@ -1177,11 +1237,14 @@ summary { cursor:pointer; color:var(--acc); font-size:13px; }
     <div class="stat"><div class="stat-num" id="st_ok">—</div><div class="stat-label">成功率</div></div>
     <div class="stat"><div class="stat-num" id="st_avg">—</div><div class="stat-label">平均耗时</div></div>
     <div class="stat"><div class="stat-num" id="st_p95">—</div><div class="stat-label">P95 耗时</div></div>
+    <div class="stat"><div class="stat-num" id="st_tokens">0</div><div class="stat-label">总 Token</div></div>
+    <div class="stat"><div class="stat-num" id="st_cost">¥0</div><div class="stat-label">总费用</div></div>
   </div>
   <div class="dist-grid">
     <div><div class="dist-title">按模型</div><div class="dist-bars" id="dist_model"></div></div>
     <div><div class="dist-title">按档位</div><div class="dist-bars" id="dist_tier"></div></div>
     <div><div class="dist-title">按供应商</div><div class="dist-bars" id="dist_provider"></div></div>
+    <div><div class="dist-title">按费用</div><div class="dist-bars" id="dist_cost"></div></div>
   </div>
   <div id="alertZone"></div>
   <div class="tabs">
@@ -1192,8 +1255,8 @@ summary { cursor:pointer; color:var(--acc); font-size:13px; }
     <button class="tab" data-f="slow">🐢 慢&gt;10s</button>
   </div>
   <table><thead><tr>
-    <th>时间</th><th>状态</th><th>耗时</th><th>档位</th><th>供应商</th><th>模型</th><th>请求摘要</th>
-  </tr></thead><tbody id="usageBody"><tr><td colspan="7" class="mut">暂无调用，发一个请求试试</td></tr></tbody></table>
+    <th>时间</th><th>状态</th><th>耗时</th><th>档位</th><th>供应商</th><th>模型</th><th>Token 入/出</th><th>费用</th><th>请求摘要</th>
+  </tr></thead><tbody id="usageBody"><tr><td colspan="9" class="mut">暂无调用，发一个请求试试</td></tr></tbody></table>
 </div>
 
 <div class="card">
@@ -1226,6 +1289,26 @@ async function api(path, opts={}) {
 }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function tiersHtml(t){ return (t||[]).map(x=>'<span class="tag">'+esc(x)+'</span>').join(''); }
+const ALL_TIERS = ['c0','c1','c2','c3'];
+function tierPills(id, tiers){
+  return ALL_TIERS.map(t=>{
+    const on = (tiers||[]).includes(t);
+    return `<button class="tier-pill ${on?'on':''}" data-model="${esc(id)}" data-tier="${t}"
+      onclick="toggleTier('${esc(id)}','${t}',this)">${t}</button>`;
+  }).join(' ');
+}
+async function toggleTier(id, tier, btn){
+  btn.disabled = true;
+  try {
+    const m = poolCache.find(x=>x.id===id);
+    const cur = new Set(m.tiers||[]);
+    if (cur.has(tier)) cur.delete(tier); else cur.add(tier);
+    const next = ALL_TIERS.filter(t=>cur.has(t));
+    if (!next.length) { alert('至少保留一个档位'); btn.disabled=false; return; }
+    await api('/admin/api/pool/'+id, {method:'PUT', body:JSON.stringify({tiers: next})});
+    await refreshPool(); await refreshStatus();
+  } catch(e){ alert('档位保存失败: '+e.message); btn.disabled=false; }
+}
 
 async function refreshProviders(){
   const d = await api('/admin/api/providers');
@@ -1254,11 +1337,33 @@ function fillFromProvider(pid, prefix){
   const pn = document.getElementById(prefix+'_provider_name');
   if (pn) pn.value = p.name||'';  // 手工表单无此框，跳过
 }
+async function loadModelList(prefix){
+  // 根据表单当前 base_url/key 拉取该供应商模型列表，填充 datalist（可下拉选也可手输）
+  const base = document.getElementById(prefix+'_base_url').value.trim();
+  if (!base) { document.getElementById(prefix+'_model_list').innerHTML = ''; return; }
+  const kf = document.getElementById(prefix+'_api_key_file').value.trim();
+  const key = kf ? '' : document.getElementById(prefix+'_api_key').value;
+  const dl = document.getElementById(prefix+'_model_list');
+  dl.innerHTML = '<option value="">加载中…</option>';
+  try {
+    const r = await api('/admin/api/discover', {method:'POST', body:JSON.stringify({
+      base_url: base, api_key_file: kf, api_key: key,
+    })});
+    if (r.ok && r.models) {
+      dl.innerHTML = r.models.map(m=>
+        `<option value="${esc(m.id)}">${esc(m.id)}（${esc(m.model_type||'?')}${m.context_window?' · ctx '+esc(fmtCtx(m.context_window)):''}）</option>`
+      ).join('');
+    } else {
+      dl.innerHTML = '';
+    }
+  } catch(e){ dl.innerHTML = ''; }
+}
 document.getElementById('d_provider').onchange = function(){
   if (this.value) fillFromProvider(this.value, 'd');
 };
 document.getElementById('f_provider').onchange = function(){
   if (this.value) fillFromProvider(this.value, 'f');
+  loadModelList('f');
 };
 
 async function refreshStatus(){
@@ -1298,7 +1403,7 @@ async function refreshPool(){
     <td>${fmtCtx(m.context_window)}</td>
     <td style="font-size:12px">${esc(m.base_url)}<br><span class="mut">${pname(m.provider_id)?'供应商: '+esc(pname(m.provider_id)):''}</span></td>
     <td>${esc(m.api_key_masked||'(无)')}</td>
-    <td>${tiersHtml(m.tiers)}</td>
+    <td>${tierPills(m.id, m.tiers||[])}</td>
     <td><input type="number" style="width:70px" value="${esc(m.priority)}" min="1"
          title="优先级：数字小优先，输入后回车/失焦保存"
          onchange="updatePriority('${esc(m.id)}', this.value)"></td>
@@ -1309,6 +1414,7 @@ async function refreshPool(){
     </td>
   </tr>`;
   }).join('') || '<tr><td colspan="9" class="mut">池为空，添加模型后自动路由生效</td></tr>';
+  poolCache = d.models;  // 保持全局缓存最新（否则新添加的模型在 toggleTier/updatePriority 里找不到）
   return d.models;
 }
 
@@ -1407,6 +1513,8 @@ function formData(){
     api_key: document.getElementById('f_api_key').value,
     tiers: document.getElementById('f_tiers').value,
     priority: document.getElementById('f_priority').value,
+    price_in: document.getElementById('f_price_in').value,
+    price_out: document.getElementById('f_price_out').value,
     enabled: document.getElementById('f_enabled').checked,
     note: document.getElementById('f_note').value,
     provider_id: document.getElementById('f_provider').value,
@@ -1421,11 +1529,14 @@ function fillForm(m){
   document.getElementById('f_api_key').value = '';
   document.getElementById('f_tiers').value = (m.tiers||[]).join(',');
   document.getElementById('f_priority').value = m.priority||100;
+  document.getElementById('f_price_in').value = m.price_in || '';
+  document.getElementById('f_price_out').value = m.price_out || '';
   document.getElementById('f_enabled').checked = !!m.enabled;
   document.getElementById('f_note').value = m.note||'';
   document.getElementById('f_provider').value = m.provider_id || '';
   document.getElementById('btnSave').textContent = '保存修改';
   document.getElementById('btnCancel').classList.remove('hidden');
+  loadModelList('f');  // 加载该供应商模型列表到下拉
 }
 async function save(){
   try {
@@ -1439,6 +1550,8 @@ function resetForm(){
   EDIT_ID = null;
   ['f_name','f_base_url','f_model','f_api_key_file','f_api_key','f_tiers','f_note'].forEach(id=>document.getElementById(id).value='');
   document.getElementById('f_priority').value='100';
+  document.getElementById('f_price_in').value='';
+  document.getElementById('f_price_out').value='';
   document.getElementById('f_enabled').checked=true;
   document.getElementById('btnSave').textContent='添加模型';
   document.getElementById('btnCancel').classList.add('hidden');
@@ -1485,6 +1598,18 @@ async function testModel(id){
     await refreshPool();  // 按钮按 last_test 变绿/红
   }
 }
+function fmtCost(v){
+  if (v == null) return '—';
+  let s = Number(v).toFixed(6).replace(/0+$/,'');
+  if (s.endsWith('.')) s += '0';
+  return '¥'+s;
+}
+function fmtTokens(n){
+  if (!n) return '0';
+  if (n >= 1000000) return (n/1000000).toFixed(n%1000000?1:0)+'M';
+  if (n >= 1000) return (n/1000).toFixed(n%1000?1:0)+'K';
+  return String(n);
+}
 let USAGE_FILTER = 'all';
 const pnameById = id => { const p = PROVIDERS.find(x=>x.id===id); return p ? p.name : (id||''); };
 function elapsedClass(s){
@@ -1512,11 +1637,26 @@ async function refreshUsage(){
     document.getElementById('st_ok').textContent = s.total ? (s.ok_rate*100).toFixed(1)+'%' : '—';
     document.getElementById('st_avg').textContent = s.total ? s.avg_elapsed+'s' : '—';
     document.getElementById('st_p95').textContent = s.total ? s.p95_elapsed+'s' : '—';
+    document.getElementById('st_tokens').textContent = s.total_tokens ? fmtTokens(s.total_tokens) : '0';
+    document.getElementById('st_cost').textContent = s.cost_known ? fmtCost(s.total_cost) : '—';
     renderDist('dist_model', s.by_model, 'c-model');
     renderDist('dist_tier', s.by_tier, 'c-tier');
     renderDist('dist_provider', s.by_provider, 'c-provider');
+    // 费用分布（金额）
+    const costEl = document.getElementById('dist_cost');
+    const costEntries = Object.entries(s.by_model_cost||{}).map(([k,v])=>[pnameById(k), v]).sort((a,b)=>b[1]-a[1]).slice(0,6);
+    if (!costEntries.length) costEl.innerHTML = '<span class="mut">暂无（模型未配价格）</span>';
+    else {
+      const maxC = Math.max(...costEntries.map(e=>e[1]));
+      costEl.innerHTML = costEntries.map(([k,v])=>`
+        <div class="dist-row">
+          <span class="dist-name">${esc(k)}</span>
+          <div class="dist-track"><div class="dist-fill c-cost" style="width:${(v/maxC*100).toFixed(1)}%"></div></div>
+          <span class="dist-val">${fmtCost(v)}</span>
+        </div>`).join('');
+    }
 
-    // 告警区：失败 + 降级
+    // 告警区：失败 + 降级 + 浪费
     const az = document.getElementById('alertZone');
     let alerts = '';
     if (u.fail_calls && u.fail_calls.length) {
@@ -1526,6 +1666,10 @@ async function refreshUsage(){
     if (u.degraded_calls && u.degraded_calls.length) {
       alerts += `<div class="alert alert-warn"><b>⚠️ 降级 ${u.degraded_calls.length} 条</b>${u.degraded_calls.map(c=>
         `<span class="alert-item">${esc(c.time)} ${esc(c.tier||'?')}→${esc(c.model||'?')} ${esc(c.elapsed_s)}s${c.text?' ·「'+esc(c.text)+'」':''}</span>`).join('')}</div>`;
+    }
+    if (u.waste_calls && u.waste_calls.length) {
+      alerts += `<div class="alert alert-warn"><b>💸 简单任务走高档模型 ${u.waste_calls.length} 条（可能升级词误触/配置问题）</b>${u.waste_calls.map(c=>
+        `<span class="alert-item">${esc(c.time)} ${esc(c.tier||'?')}→${esc(c.model||'?')} ${fmtCost(c.cost)}${c.text?' ·「'+esc(c.text)+'」':''}</span>`).join('')}</div>`;
     }
     az.innerHTML = alerts;
 
@@ -1543,8 +1687,10 @@ async function refreshUsage(){
       <td>${esc(c.tier||'—')}</td>
       <td class="mut">${esc(pnameById(c.provider))}</td>
       <td>${esc(c.model||'—')}</td>
-      <td class="mut" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.text||'')}">${esc(c.text||'—')}</td>
-    </tr>`).join('') || '<tr><td colspan="7" class="mut">当前筛选无记录</td></tr>';
+      <td class="mut">${fmtTokens(c.tokens_in)}/${fmtTokens(c.tokens_out)}</td>
+      <td>${c.cost_known?fmtCost(c.cost):'<span class="mut">—</span>'}</td>
+      <td class="mut" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.text||'')}">${esc(c.text||'—')}</td>
+    </tr>`).join('') || '<tr><td colspan="9" class="mut">当前筛选无记录</td></tr>';
   } catch(e){ /* 静默，下次再刷 */ }
 }
 
@@ -1577,6 +1723,28 @@ document.querySelectorAll('.tab').forEach(t=>{
   t.onclick = ()=>{ USAGE_FILTER = t.dataset.f; document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active')); t.classList.add('active'); refreshUsage(); };
 });
 (async function init(){
+  // 给每个卡片 h2 注入折叠按钮（记忆状态）
+  document.querySelectorAll('.card').forEach(card=>{
+    const h2 = card.querySelector('h2');
+    if (!h2 || card.querySelector('.collapse-btn')) return;
+    const btn = document.createElement('button');
+    btn.className = 'collapse-btn';
+    btn.textContent = '−';
+    btn.title = '折叠 / 展开';
+    h2.appendChild(btn);
+    const storageKey = 'ts-collapsed-' + (card.querySelector('h2') ? card.querySelector('h2').textContent.trim().slice(0,6) : Math.random().toString(36).slice(2,6));
+    const applyState = ()=>{
+      const on = card.classList.contains('collapsed');
+      btn.textContent = on ? '+' : '−';
+    };
+    btn.onclick = ()=>{
+      card.classList.toggle('collapsed');
+      applyState();
+      try { localStorage.setItem(storageKey, card.classList.contains('collapsed') ? '1' : '0'); } catch(e){}
+    };
+    try { if (localStorage.getItem(storageKey) === '1') card.classList.add('collapsed'); } catch(e){}
+    applyState();
+  });
   try { poolCache = (await api('/admin/api/pool')).models; } catch(e){}
   await refreshProviders(); await refreshPool(); await refreshStatus(); await refreshUsage();
   setInterval(refreshUsage, 3000);  // 实时调用每 3 秒刷新
@@ -1781,9 +1949,37 @@ async def chat_completions(request: Request) -> Any:
 
     if stream:
         async def gen():
+            _usage_done = False
             try:
                 async for chunk in upstream.aiter_bytes():
                     yield chunk
+                    # 轻量解析 SSE 里的 usage（OpenAI 标准：流末尾 data: {...usage...}）
+                    if not _usage_done and chunk:
+                        try:
+                            text = chunk.decode("utf-8", "replace")
+                            for line in text.splitlines():
+                                if not line.startswith("data: "):
+                                    continue
+                                payload = json.loads(line[6:].strip())
+                                usage = payload.get("usage") if isinstance(payload, dict) else None
+                                if usage:
+                                    _entry = getattr(request.state, "call_entry", None)
+                                    if _entry is not None:
+                                        tin = int(usage.get("prompt_tokens") or 0)
+                                        tout = int(usage.get("completion_tokens") or 0)
+                                        _entry["tokens_in"] = tin
+                                        _entry["tokens_out"] = tout
+                                        _entry["tokens_total"] = int(usage.get("total_tokens") or (tin + tout))
+                                        if selected_cfg is not None:
+                                            p_in = float(selected_cfg.get("price_in") or 0)
+                                            p_out = float(selected_cfg.get("price_out") or 0)
+                                            if p_in or p_out:
+                                                _entry["cost"] = round(tin / 1e6 * p_in + tout / 1e6 * p_out, 6)
+                                                _entry["cost_known"] = True
+                                    _usage_done = True
+                                    break
+                        except Exception:
+                            pass
             finally:
                 await client.aclose()
 
@@ -1802,6 +1998,30 @@ async def chat_completions(request: Request) -> Any:
     if data is None:
         logger.error("upstream non-JSON response body=%s", raw[:500])
         return JSONResponse(status_code=502, content={"error": {"message": "upstream returned non-JSON", "type": "upstream_error"}})
+
+    # 记录 usage（Token 数）+ 按模型价格算费用
+    _entry = getattr(request.state, "call_entry", None)
+    if _entry is not None:
+        usage = data.get("usage") or {}
+        tin = int(usage.get("prompt_tokens") or 0)
+        tout = int(usage.get("completion_tokens") or 0)
+        _entry["tokens_in"] = tin
+        _entry["tokens_out"] = tout
+        _entry["tokens_total"] = int(usage.get("total_tokens") or (tin + tout))
+        # 费用：模型池 price_in/price_out（¥/1M tokens）
+        if selected_cfg is not None:
+            p_in = float(selected_cfg.get("price_in") or 0)
+            p_out = float(selected_cfg.get("price_out") or 0)
+            if p_in or p_out:
+                _entry["cost"] = round(tin / 1e6 * p_in + tout / 1e6 * p_out, 6)
+                _entry["cost_known"] = True
+        route_info["usage"] = {
+            "tokens_in": _entry["tokens_in"],
+            "tokens_out": _entry["tokens_out"],
+            "tokens_total": _entry["tokens_total"],
+            "cost": _entry["cost"],
+            "cost_known": _entry["cost_known"],
+        }
 
     # 附加路由元数据（放在顶层自定义字段，标准客户端忽略未知字段）
     data["x_tokensaver"] = route_info

@@ -155,3 +155,39 @@
 ### 实测
 - discover 机缘 → deepseek-v4-flash/pro ctx=1000000、glm-5.1 ctx=200000 ✅
 - 优先级 PUT 7→5 ✅
+
+## [v4.8] 2026-08-20 Token/费用统计（机缘用量页风格）
+
+### 新增
+- **Token 统计**：非流式请求自动记录输入/输出/总 Token（从上游 usage 提取）
+- **费用计算**：模型池新增 price_in/price_out（¥/百万 token），编辑表单可填，
+  费用 = 入 token/1M×入价 + 出 token/1M×出价；未配置价格显示 —
+- **实时调用增强**：统计卡新增「总 Token」「总费用」；明细表新增
+  「Token 入/出」列（如 286K/577）和「费用」列（¥0.034538）
+- 路由元数据 x_tokensaver 增加 usage（tokens/cost）
+
+### 说明
+- 价格为演示值（机缘 flash 1/2 ¥/M），请按各渠道真实价格在编辑表单修改
+- 流式响应暂不统计 token（SSE 透传，需 stream_options.include_usage 支持，后续可加）
+
+## [v4.9] 2026-08-20 档位内联编辑
+
+### 变更
+- **档位列改为可勾选 pill**：每个模型旁直接显示 c0/c1/c2/c3 四个小按钮，
+  点击切换（勾选即保存 PUT tiers），无需进编辑表单
+- 档位语义确认：c0-c3 为 opensquilla 分类器内置输出粒度（TEXT_TIERS），
+  档位=模型服务的需求等级（可多选），优先级=同档位内排序（数字小优先），两者职责不同
+
+## [v5.0] 2026-08-20 省钱三件套
+
+### 新增
+- **按费用分布**：实时调用分布区新增「按费用」条，显示每个模型花了多少钱（需配价格）
+- **浪费告警**：判档简单（c0/c1）却走了高档模型（名含 pro/think/max 等）→ 黄色告警，
+  提示可能升级词误触/配置问题
+- **流式 Token 记账**：解析 SSE 末尾 usage chunk（stream_options.include_usage），
+  流式请求也能统计 Token 和费用
+- **路由配置修正**：机缘 flash→c0/c1（简单）、pro→c2/c3（复杂）、flash-0731→c0/c1 备胎
+
+### 实测（4 请求）
+- 简单 c1→flash / 复杂 c3→pro / 升级词 c3→pro / 流式 c0→flash
+- 总 token 207，总费用 ¥0.000793，waste=0 degraded=0 fail=0
