@@ -1756,6 +1756,7 @@ summary { cursor:pointer; color:var(--acc); font-size:13px; }
     <div class="stat"><div class="stat-num" id="st_p95">—</div><div class="stat-label">P95 耗时</div></div>
     <div class="stat"><div class="stat-num" id="st_tokens">0</div><div class="stat-label">总 Token</div></div>
     <div class="stat"><div class="stat-num" id="st_cached">0</div><div class="stat-label">缓存命中 Token</div></div>
+    <div class="stat"><div class="stat-num" id="st_saved" style="color:var(--ok)">¥0</div><div class="stat-label">缓存已节省</div></div>
     <div class="stat"><div class="stat-num" id="st_cost">¥0</div><div class="stat-label">总费用</div></div>
   </div>
   <div class="tabs" id="rangeTabs">
@@ -2168,8 +2169,9 @@ async function refreshUsage(){
     document.getElementById('st_p95').textContent = s.total ? s.p95_elapsed+'s' : '—';
     document.getElementById('st_tokens').textContent = s.total_tokens ? fmtTokens(s.total_tokens) : '0';
     document.getElementById('st_cached').textContent = s.total_cached_tokens ? fmtTokens(s.total_cached_tokens) : '0';
+    document.getElementById('st_saved').textContent = s.cached_savings>0 ? fmtCost(s.cached_savings) : '¥0';
     document.getElementById('st_cost').textContent = s.cost_known ? fmtCost(s.total_cost) : '—';
-    document.getElementById('rangeHint').textContent = (s.cached_savings>0 ? '缓存节省 ≈ '+fmtCost(s.cached_savings) : '');
+    document.getElementById('rangeHint').textContent = (s.total_cached_tokens>0 && s.cached_savings<=0) ? '⚠️ 缓存模型未配缓存价，费用按全价计（高估）' : '';
     renderDist('dist_model', s.by_model, 'c-model');
     renderDist('dist_tier', s.by_tier, 'c-tier');
     renderDist('dist_provider', s.by_provider, 'c-provider');
