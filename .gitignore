@@ -39,3 +39,5 @@ providers.json
 
 # 其他密钥（无 .key 后缀的也要拦）
 sensenova_key
+
+newapi_key

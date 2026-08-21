@@ -2400,7 +2400,7 @@ async def chat_completions(request: Request) -> Any:
         tier = "img"
         upstream_model, selected_cfg = pick_model_from_pool(tier)
         if upstream_model is None:
-            upstream_model = "sensenova-6.8-flash-lite"
+            upstream_model = "glm-4.6v-flash"
             selected_cfg = None
         route_info = {
             "tier": tier,

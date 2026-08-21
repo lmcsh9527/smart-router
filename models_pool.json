@@ -257,11 +257,11 @@
     },
     {
       "id": "sensenova-6.8-flash-lite",
-      "name": "日日新 6.8 Flash Lite（识图·免费）",
-      "base_url": "https://token.sensenova.cn/v1",
-      "api_key_file": "sensenova_key",
+      "name": "智谱 GLM-4.6V Flash（识图·免费）",
+      "base_url": "http://127.0.0.1:3000/v1",
+      "api_key_file": "newapi_key",
       "api_key": "",
-      "model": "sensenova-6.8-flash-lite",
+      "model": "glm-4.6v-flash",
       "tiers": [
         "img"
       ],
