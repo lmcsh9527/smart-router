@@ -252,3 +252,15 @@
 - 范围聚合：today/7d/30d/all + 趋势 + bogus 回退 today ✅
 - 实机：机缘上游返回 OpenAI 格式 `cached_tokens=0`（当前无缓存命中），解析器正常读取；
   调用持久化落盘 ✅；**重启网关后 today 费用/Token 统计保留**（total 15 / cost 0.009702 / tokens 3430）✅
+
+## [v5.3.1] 2026-08-21 修复流式调用记不到 token/费用
+
+### 修复
+- 流式请求强制注入 `stream_options.include_usage=true`：DSH 等客户端常不带该参数，
+  上游不返回 usage → 流式调用记不到 token/费用（此前大量 0/0）
+- 流式落盘延后到响应体消费后（usage 在 SSE 末尾才解析），
+  避免 middleware 在响应返回时落盘 0/0 的占位记录；非流式保持原路径
+
+### 实测
+- 流式：10/144 tokens，cost ¥0.000298，cost_known=true ✅
+- 非流式对照：10/19 tokens，cost ¥0.000048 ✅

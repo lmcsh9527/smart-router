@@ -829,7 +829,9 @@ async def log_calls_middleware(request: Request, call_next):
     entry["session_key"] = response.headers.get("X-TokenSaver-Session-Key", "")
     entry["turn_index"] = int(response.headers.get("X-TokenSaver-Turn-Index", "0") or 0)
     CALL_LOG.appendleft(entry)
-    _persist_call_entry(entry)
+    # 流式请求的 usage 在响应体消费时才解析，延后到 gen() 里落盘；非流式这里已完整
+    if not (response.headers.get("content-type") or "").startswith("text/event-stream"):
+        _persist_call_entry(entry)
     return response
     return response
 
@@ -2467,6 +2469,10 @@ async def chat_completions(request: Request) -> Any:
 
     # ---- 构造上游请求（带降级重试链） ----
     payload = dict(body)
+    # 强制上游返回 usage（流式）：DSH 等客户端常不带 stream_options.include_usage，
+    # 不注入的话上游不返回 usage，流式调用就记不到 token/费用。
+    if stream:
+        payload.setdefault("stream_options", {})["include_usage"] = True
 
     # 流式一旦开始输出就不能降级（只能透传），故流式只尝试首选模型
     if tier == "img" and selected_cfg is not None:
@@ -2578,6 +2584,7 @@ async def chat_completions(request: Request) -> Any:
     if stream:
         async def gen():
             _usage_done = False
+            _persisted = False
             try:
                 async for chunk in upstream.aiter_bytes():
                     yield chunk
@@ -2594,12 +2601,18 @@ async def chat_completions(request: Request) -> Any:
                                     _entry = getattr(request.state, "call_entry", None)
                                     if _entry is not None:
                                         _apply_usage_to_entry(_entry, usage, selected_cfg)
+                                        _persist_call_entry(_entry)
+                                        _persisted = True
                                     _usage_done = True
                                     break
                         except Exception:
                             pass
             finally:
                 await client.aclose()
+                if not _persisted:
+                    _entry = getattr(request.state, "call_entry", None)
+                    if _entry is not None:
+                        _persist_call_entry(_entry)
 
         return StreamingResponse(
             gen(),
