@@ -559,17 +559,36 @@ def last_user_text(messages: list[dict]) -> str:
     return ""
 
 
-def has_image_part(messages: list[dict]) -> bool:
-    """检测请求消息里是否含图片（OpenAI image_url 或 host image part）。"""
-    for msg in messages or []:
+def has_new_image(messages: list[dict]) -> bool:
+    """只检测【当前轮】（最新一条 user 消息）是否含图片——决定是否走识图模型。
+    历史回合里的旧图不再影响路由（避免长上下文因残留截图被全走识图模型）。"""
+    for msg in reversed(messages or []):
         if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "user":
             continue
         content = msg.get("content", "")
         if isinstance(content, list):
             for seg in content:
                 if isinstance(seg, dict) and seg.get("type") in ("image_url", "image", "input_image"):
                     return True
+        return False
     return False
+
+
+def strip_image_parts(messages: list[dict]) -> list[dict]:
+    """剥掉 messages 中所有图片段（image_url/image/input_image），返回文本模型可用的副本。"""
+    out = []
+    for msg in (messages or []):
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        m = dict(msg)
+        content = m.get("content", "")
+        if isinstance(content, list):
+            m["content"] = [seg for seg in content if not (isinstance(seg, dict) and seg.get("type") in ("image_url", "image", "input_image"))]
+        out.append(m)
+    return out
 
 
 # ---------- 自学习采集（只存特征向量，不存原文；best-effort 不阻塞主流程） ----------
@@ -2354,7 +2373,7 @@ async def chat_completions(request: Request) -> Any:
     text = last_user_text(messages)
 
     # ---- 路由决策 ----
-    if has_image_part(messages):
+    if has_new_image(messages):
         # 图片请求：直接路由日日新视觉模型（免费至 2026-08-31），不走复杂度判档
         tier = "img"
         upstream_model, selected_cfg = pick_model_from_pool(tier)
@@ -2469,6 +2488,9 @@ async def chat_completions(request: Request) -> Any:
 
     # ---- 构造上游请求（带降级重试链） ----
     payload = dict(body)
+    # 文字路由：剥掉历史消息里的图片段，避免文本模型收到 image_url 报错；识图路由保留
+    if tier != "img":
+        payload["messages"] = strip_image_parts(payload.get("messages") or [])
     # 强制上游返回 usage（流式）：DSH 等客户端常不带 stream_options.include_usage，
     # 不注入的话上游不返回 usage，流式调用就记不到 token/费用。
     if stream:
