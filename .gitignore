@@ -41,3 +41,8 @@ providers.json
 sensenova_key
 
 newapi_key
+
+# API key 文件（一律不入库）
+openrouter_api_key
+*_api_key
+小红书发布素材/

@@ -57,11 +57,21 @@ OpenAI 兼容的**智能路由省钱网关**——自动判断问题复杂度（
 
 ### 启动
 
+**方式 A · 一键安装（推荐）**
+
+```bash
+bash install.sh             # 依赖安装 + 配置初始化
+bash install.sh --launchd   # macOS 开机自启 + 崩溃保活
+bash scripts/doctor.sh      # 健康自检
+```
+
+**方式 B · 手动运行**
+
 ```bash
 cd tokensaver
 
 # 1. 配置 API Key（推荐：写入项目目录 600 权限文件，后台填 Key 文件路径）
-#    机缘示例：把 key 写入 jy_api_key，后台选 Key 文件 jy_api_key
+#    示例：把 key 写入 my_provider_key 文件，后台选择该 Key 文件
 #    或直接在后台页面填 Key
 
 # 2. 启动网关（首次加载路由模型，约数秒）

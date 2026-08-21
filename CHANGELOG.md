@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.0] - 2026-08-21 - 一键安装 · 健康自检 · DSH 对接
+
+- 新增 `install.sh` 一键安装器：Python≥3.10 自动检测、venv 隔离、配置初始化（不覆盖已有）、`--launchd` 开机自启+崩溃保活、`--doctor` 装后自检
+- 新增 `scripts/doctor.sh` 健康自检：网关在线 / 模型池合法 / c0-c3 档位覆盖 / 密钥文件与权限 / 上游可达性 / launchd 常驻状态
+- 新增 `docs/dsh-integration.md`：DSH Desktop 对接指南（后台一键接入 + 手工 provider 配置）
+- `requirements.txt` 补齐智能分类器完整运行依赖（numpy / scikit-learn / lightgbm / onnxruntime / tokenizers / structlog / joblib / PyYAML）——修复新环境装完无法启动的问题
+- README 快速开始改为「一键安装 / 手动」双方式；密钥类文件一律不入库（`*_api_key`）
+- 用户配置 `models_pool.json` 移出版本跟踪（模板 `models_pool.example.json` 为准）
+
 ## [0.1.0] - 2026-08-19 - MVP 初始版本
 
 - 项目骨架建立（README / LICENSE / .gitignore / CONTRIBUTING / docs）
