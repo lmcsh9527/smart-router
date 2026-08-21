@@ -1,30 +1,105 @@
-# TokenSaver / Smart Router
+<div align="center">
 
-**中文** | [English](README.en.md)
+# 💰 TokenSaver · Smart Router
 
-OpenAI 兼容的**智能路由省钱网关**——自动判断问题复杂度（简单/中等/复杂），简单问题走便宜轻量模型、复杂问题走强模型，让你不用手动选模型也能省 token 钱。
+**OpenAI 兼容的智能路由省钱网关**
+简单问题自动走轻量模型，复杂问题才动强模型——不用手动选模型，token 费用直省一半起
 
-内置 OpenSquilla 智能分类器（已 vendor 化进仓库），配合**模型池 + 供应商库**后台管理，发现式添加模型，一键验证模型真实可用。
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#快速开始)
+[![Release](https://img.shields.io/github/v/tag/lmcsh9527/smart-router?label=release&color=green)](https://github.com/lmcsh9527/smart-router/releases)
+[![Stars](https://img.shields.io/github/stars/lmcsh9527/smart-router?style=social)](https://github.com/lmcsh9527/smart-router/stargazers)
+
+![实时调用监控](docs/screenshots/hero-dashboard.png)
+
+*实时调用监控 —— 总量 / 成功率 / P95 / Token / 费用，每一分钱花在哪一眼看清*
+
+**中文** · [English](README.en.md)
+
+</div>
+
+---
+
+## 为什么需要它
+
+接了多个大模型供应商后，最常见的两种浪费：
+
+- **杀鸡用牛刀**：闲聊、单步问答也调最强模型，费用翻好几倍
+- **手动选模型累**：每条消息先想想"这题难不难"，注意力被打断
+
+TokenSaver 在中间加一层网关：客户端永远只填 `model=auto`，内置分类器自动判断问题复杂度（c0-c3 四档），**简单问题路由到轻量模型、复杂问题才升级强模型**，失败还会自动沿降级链兜底。
 
 ## ✨ 特性
 
-- 🧠 **智能路由**：OpenSquilla SquillaRouter 自动判档（c0-c3），简单→轻量模型、复杂→强模型
-- 🔌 **OpenAI 兼容**：`POST /v1/chat/completions`（非流式 + SSE 流式），任何客户端填 `base_url=http://localhost:20130/v1` + `model=auto` 即用
-- 🗂️ **模型池 + 供应商库**：后台页面管理多个模型，每个模型独立 base_url/Key/档位/优先级
-- 🔍 **发现式添加**：填 Base URL + Key → 点「获取模型」→ 自动拉取模型列表 → 勾选批量入池
-- ✅ **真实功能验证**：测试不是连通性检查——发 `1+1=?` 短消息校验**真有回复内容且答对**，生图模型自动走生图接口；通过绿/失败红，持久显示
-- 📊 **实时调用监控**：统计卡（总量/成功率/平均/P95/总 Token/总费用）、按模型/档位/供应商/**费用**分布、失败/降级/浪费告警、请求摘要明细、流式 Token 记账
-- 💸 **省钱洞察**：按模型费用分布 + "简单任务走高档模型"浪费告警，一眼看出钱花哪了
-- 🔄 **自动降级链**：高档模型失败自动降级到低档，保证请求能出结果
-- 📏 **上下文自动识别**：从 `/v1/models` 或本地模型目录自动带出上下文长度（1M/200K…）
+| | 特性 | 说明 |
+|---|---|---|
+| 🧠 | **智能判档路由** | OpenSquilla SquillaRouter 自动判档（c0-c3），vendor 化内置、离线可用 |
+| 🔌 | **OpenAI 兼容** | 非流式 + SSE 流式；任何客户端填 `base_url` + `model=auto` 即用 |
+| 🗂️ | **模型池 + 供应商库** | 后台可视化管理，每个模型独立 base_url / Key / 档位 / 优先级 |
+| 🔍 | **发现式添加** | 填 Base URL + Key → 一键拉取模型列表 → 勾选批量入池 |
+| ✅ | **真实功能验证** | 不是 ping 通就过——发 `1+1=?` 校验真有正确回复；生图模型走生图接口 |
+| 📊 | **实时调用监控** | 总量/成功率/P95/Token/费用统计卡，按模型/档位/供应商分布，请求明细可 👍👎 纠错 |
+| 💸 | **省钱洞察** | 费用分布 + "简单任务走高档模型"浪费告警 |
+| 🔄 | **自动降级链** | 高档失败/超时自动降级低档，保证请求出结果 |
+| 🧠 | **自学习**（实验） | 样本采集、纠错反馈、训练门控、模型版本管理 |
 
 ## 📸 截图
 
-![后台总览](docs/screenshots/04-full-page.png)
-
-| 顶部统计 | 模型池 |
+| 实时调用监控 | 模型池 |
 |---|---|
 | ![顶部统计](docs/screenshots/01-overview-top.png) | ![模型池](docs/screenshots/02-model-pool.png) |
+
+## 🚀 快速开始
+
+```bash
+bash install.sh             # ① 依赖安装 + 配置初始化
+bash install.sh --launchd   # ② macOS 开机自启 + 崩溃保活（可选）
+bash scripts/doctor.sh      # ③ 健康自检
+```
+
+然后打开后台 **http://localhost:20130/admin** 添加你的模型渠道（Base URL + Key → 获取模型 → 入池），客户端这样接：
+
+```
+Base URL: http://localhost:20130/v1
+Model:    auto          ← 自动判档路由
+API Key:  随意填（本地网关不校验）
+```
+
+<details>
+<summary><b>手动安装 / 冒烟测试</b></summary>
+
+```bash
+# 依赖：Python ≥3.10
+pip install -r requirements.txt     # 分类器模型资产在 vendor/ 已内置
+python3 gateway.py                  # 或 uvicorn gateway:app --host 0.0.0.0 --port 20130
+
+# 冒烟测试
+curl http://localhost:20130/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"1+1等于几"}]}'
+```
+
+配置模板：`cp models_pool.example.json models_pool.json`
+</details>
+
+<details>
+<summary><b>接入 DSH Desktop</b></summary>
+
+后台提供一键 DSH 接入；或手工在 `settings.yaml` 加 provider（详见 [docs/dsh-integration.md](docs/dsh-integration.md)）。
+</details>
+
+## 🎛️ 路由档位
+
+| 档位 | 含义 | 建议模型 |
+|---|---|---|
+| c0 | 最简单（闲聊/单步问答） | 轻量 flash |
+| c1 | 简单 | 轻量 flash |
+| c2 | 中等（分析/代码） | 强模型 pro |
+| c3 | 复杂（深度推理/长文） | 最强模型 |
+
+- 升级词：用户说"用最好的模型/深度思考" → 强制 c3
+- 显式模型：客户端指定具体模型名 → 直接透传（查池匹配）
 
 ## 🏗️ 架构
 
@@ -39,90 +114,16 @@ OpenAI 兼容的**智能路由省钱网关**——自动判断问题复杂度（
 │  3. 直连供应商 API 转发      │
 └─────────────────────────────┘
         │
-        ├── 供应商 A (机缘 tokenrhythm.studio) ── flash / pro
-        ├── 供应商 B (轻舟 lightboat.dpdns.org) ── glm5.2 / minimaxm3 ...
+        ├── 供应商 A ── flash / pro
+        ├── 供应商 B ── 其他模型 ...
         └── 供应商 C ...（后台自由添加）
 
-分类器：vendor/opensquilla（SquillaRouter 模型资产已内置仓库，Apache-2.0）
+分类器：vendor/opensquilla（SquillaRouter 模型资产已内置仓库）
 ```
 
 > 已彻底脱离 9router：路由判断、转发、降级全部由 TokenSaver 自己完成。
 
-## 🚀 快速开始
-
-### 依赖
-
-- Python 3.10+
-- `pip install -r requirements.txt`（fastapi / httpx / uvicorn；分类器模型资产在 `vendor/` 已内置）
-
-### 启动
-
-**方式 A · 一键安装（推荐）**
-
-```bash
-bash install.sh             # 依赖安装 + 配置初始化
-bash install.sh --launchd   # macOS 开机自启 + 崩溃保活
-bash scripts/doctor.sh      # 健康自检
-```
-
-**方式 B · 手动运行**
-
-```bash
-cd tokensaver
-
-# 1. 配置 API Key（推荐：写入项目目录 600 权限文件，后台填 Key 文件路径）
-#    示例：把 key 写入 my_provider_key 文件，后台选择该 Key 文件
-#    或直接在后台页面填 Key
-
-# 2. 启动网关（首次加载路由模型，约数秒）
-python3 gateway.py
-#   或 uvicorn gateway:app --host 0.0.0.0 --port 20130
-
-# 3. 冒烟测试
-curl http://localhost:20130/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"auto","messages":[{"role":"user","content":"1+1等于几"}]}'
-
-# 流式
-curl -N http://localhost:20130/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"auto","messages":[{"role":"user","content":"写一个B树实现"}],"stream":true}'
-```
-
-### 后台管理页面
-
-浏览器打开 **http://localhost:20130/admin**
-
-| 功能 | 说明 |
-|---|---|
-| 快速发现模型 | 填 Base URL + Key → 获取模型 → 勾选批量入池（供应商自动保存） |
-| 模型池 | 测试（1+1 验证 / 生图验证）、编辑、删除、启用/禁用切换、优先级就地改 |
-| 供应商库 | 管理供应商（地址/Key 自动保存，下次直接选） |
-| 实时调用 | 统计卡 + 分布 + 失败/降级告警 + 明细过滤（每条可👍/👎纠错） |
-| 🧠 自学习 | 样本采集（只存特征向量）、纠错反馈、训练门控/一键训练、模型版本/上线状态 |
-
-### 示例配置
-
-```bash
-cp providers.example.json providers.json          # 供应商模板
-cp models_pool.example.json models_pool.json      # 模型池模板
-```
-
-> ⚠️ `models_pool.json` / `providers.json` / `*_api_key` 含真实密钥，已加入 `.gitignore`，**不要提交**。
-
-## 🎛️ 路由档位
-
-| 档位 | 含义 | 建议模型 |
-|---|---|---|
-| c0 | 最简单（闲聊/单步问答） | 轻量 flash |
-| c1 | 简单 | 轻量 flash |
-| c2 | 中等（分析/代码） | 强模型 pro |
-| c3 | 复杂（深度推理/长文） | 最强模型 |
-
-- 升级词：用户说"用最好的模型/深度思考" → 强制 c3
-- 显式模型：客户端指定具体模型名 → 直接透传（查池匹配）
-
-## 📡 API
+## 📡 API 一览
 
 | 端点 | 说明 |
 |---|---|
@@ -135,19 +136,21 @@ cp models_pool.example.json models_pool.json      # 模型池模板
 | `GET/POST /admin/api/providers` | 供应商 CRUD |
 | `POST /admin/api/discover` | 发现模型（自动保存供应商） |
 | `GET /admin/api/usage` | 实时调用统计 |
-| `GET /admin/api/selflearning/status` | 自学习状态（样本数/门控/版本/训练任务） |
-| `POST /admin/api/selflearning/feedback` | 纠错反馈（up/down/neutral） |
-| `POST /admin/api/selflearning/train` | 触发一次训练（后台） |
-| `GET /admin/api/status` | 路由状态预览 |
+| `GET /admin/api/selflearning/status` | 自学习状态 |
+| `POST /admin/api/selflearning/feedback` | 纠错反馈 |
+
+更多文档：[docs/config.md](docs/config.md) · [docs/design.md](docs/design.md) · [docs/faq.md](docs/faq.md) · [CHANGELOG.md](CHANGELOG.md)
+
+## 🔒 密钥安全
+
+`models_pool.json` / `providers.json` / `*_api_key` 含真实密钥与渠道信息，均已加入 `.gitignore`，**不会也不应提交**。后台页面展示的 Key 均为脱敏形式。
 
 ## 📄 许可
 
-- 本项目：Apache-2.0（见 LICENSE）
+- 本项目：MIT（见 [LICENSE](LICENSE)）
 - 内置分类器来自 [OpenSquilla](https://github.com/opensquilla/opensquilla)（Apache-2.0，模型资产随仓库分发）
-- 灵感：OpenSquilla 智能路由 + 开源中转网关生态
 
 ## 🧑‍💻 开发
 
-- `CHANGELOG.md`：版本历史
-- `docs/`：设计/配置/FAQ
-- `CONTRIBUTING.md`：贡献指南
+- [CONTRIBUTING.md](CONTRIBUTING.md)：贡献指南
+- [docs/design.md](docs/design.md)：设计文档
