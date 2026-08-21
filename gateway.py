@@ -24,6 +24,7 @@ OpenAI 兼容网关：
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -687,6 +688,99 @@ def _body_text_summary(body_bytes: bytes, limit: int = 50) -> str:
     return ""
 
 
+# ---------- 调用记录持久化（按日期 JSONL，重启不丢） ----------
+CALLS_DATA_DIR = os.path.expanduser("~/.opensquilla/router/data/tokensaver")
+
+
+def _calls_path(day: str) -> str:
+    return os.path.join(CALLS_DATA_DIR, f"calls-{day}.jsonl")
+
+
+def _persist_call_entry(entry: dict) -> None:
+    """Best-effort 把一条调用记录 append 到当日文件；失败只记日志。"""
+    try:
+        day = str(entry.get("ts") or "")[:10] or time.strftime("%Y-%m-%d", time.gmtime())
+        path = _calls_path(day)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.warning("CALL persist failed (best-effort): %s", exc)
+
+
+def _load_call_rows(period: str) -> list[dict]:
+    """读 calls-YYYY-MM-DD.jsonl 并按 period（today/7d/30d/all）过滤。"""
+    today = datetime.now(UTC).date()
+    days = {"today": 0, "7d": 7, "30d": 30, "all": 3650}.get(period, 0)
+    start = today - timedelta(days=days)
+    rows: list[dict] = []
+    for path in sorted(glob.glob(os.path.join(CALLS_DATA_DIR, "calls-*.jsonl"))):
+        name = os.path.basename(path)
+        try:
+            day = datetime.strptime(name[len("calls-"):-len(".jsonl")], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if day < start:
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            continue
+    return rows
+
+
+def _extract_cached_tokens(usage: dict) -> int:
+    """兼容 DeepSeek prompt_cache_hit_tokens 与 OpenAI prompt_tokens_details.cached_tokens。"""
+    try:
+        if not isinstance(usage, dict):
+            return 0
+        v = usage.get("prompt_cache_hit_tokens")
+        if v is not None:
+            return int(v)
+        details = usage.get("prompt_tokens_details") or {}
+        if isinstance(details, dict):
+            c = details.get("cached_tokens")
+            if c is not None:
+                return int(c)
+    except (TypeError, ValueError):
+        pass
+    return 0
+
+
+def _apply_usage_to_entry(entry: dict, usage: dict, cfg: dict | None) -> None:
+    """usage → entry（token/缓存/费用）。缓存命中按 price_cached 计费，未配置则按输入价（保守）。"""
+    tin = int(usage.get("prompt_tokens") or 0)
+    tout = int(usage.get("completion_tokens") or 0)
+    cached = _extract_cached_tokens(usage)
+    entry["tokens_in"] = tin
+    entry["tokens_out"] = tout
+    entry["tokens_total"] = int(usage.get("total_tokens") or (tin + tout))
+    entry["cached_tokens"] = cached
+    entry["cached_savings"] = 0.0
+    if cfg is not None:
+        p_in = float(cfg.get("price_in") or 0)
+        p_out = float(cfg.get("price_out") or 0)
+        p_cached = float(cfg.get("price_cached") or 0)
+        if p_in or p_out:
+            if p_cached <= 0:
+                p_cached = p_in
+            billable_in = max(0, tin - cached)
+            entry["cost"] = round(
+                billable_in / 1e6 * p_in + cached / 1e6 * p_cached + tout / 1e6 * p_out, 6
+            )
+            entry["cost_known"] = True
+            if cached and float(cfg.get("price_cached") or 0) > 0:
+                entry["cached_savings"] = round(cached / 1e6 * (p_in - p_cached), 6)
+
+
 @app.middleware("http")
 async def log_calls_middleware(request: Request, call_next):
     """记录 /v1/chat/completions 调用：时间/状态/耗时/档位/模型/来源/文本摘要/Token/费用。"""
@@ -701,6 +795,7 @@ async def log_calls_middleware(request: Request, call_next):
     start = time.time()
     entry = {
         "time": time.strftime("%H:%M:%S"),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "status": 0,
         "elapsed_s": 0.0,
         "tier": "",
@@ -715,6 +810,8 @@ async def log_calls_middleware(request: Request, call_next):
         "tokens_in": 0,
         "tokens_out": 0,
         "tokens_total": 0,
+        "cached_tokens": 0,
+        "cached_savings": 0.0,
         "cost": 0.0,
         "cost_known": False,  # 模型配置了价格才算得出费用
     }
@@ -732,6 +829,7 @@ async def log_calls_middleware(request: Request, call_next):
     entry["session_key"] = response.headers.get("X-TokenSaver-Session-Key", "")
     entry["turn_index"] = int(response.headers.get("X-TokenSaver-Turn-Index", "0") or 0)
     CALL_LOG.appendleft(entry)
+    _persist_call_entry(entry)
     return response
     return response
 
@@ -750,45 +848,57 @@ def _is_high_end_model(model: str) -> bool:
 
 
 @app.get("/admin/api/usage")
-async def admin_usage() -> dict:
-    calls = list(CALL_LOG)
-    total = len(calls)
-    ok = sum(1 for c in calls if c["status"] == 200)
-    elapseds = sorted(c["elapsed_s"] for c in calls)
+async def admin_usage(period: str = "today") -> dict:
+    """按日期范围聚合费用/调用（持久化 calls-*.jsonl）；实时明细/告警仍取内存最近。"""
+    period = (period or "today").strip().lower()
+    if period not in ("today", "7d", "30d", "all"):
+        period = "today"
+    rows = _load_call_rows(period)
+    total = len(rows)
+    ok = sum(1 for c in rows if c.get("status") == 200)
+    elapseds = sorted(float(c.get("elapsed_s") or 0) for c in rows)
     by_model: dict[str, int] = {}
     by_tier: dict[str, int] = {}
     by_provider: dict[str, int] = {}
-    for c in calls:
+    by_model_cost: dict[str, float] = {}
+    trend: dict[str, dict] = {}
+    total_tokens = 0
+    total_cost = 0.0
+    total_cached = 0
+    cached_savings = 0.0
+    for c in rows:
         m = c.get("model") or "?"
         t = c.get("tier") or "?"
         p = c.get("provider") or "?"
         by_model[m] = by_model.get(m, 0) + 1
         by_tier[t] = by_tier.get(t, 0) + 1
         by_provider[p] = by_provider.get(p, 0) + 1
-    # 最近 30 分钟趋势（按分钟）
-    now = time.time()
-    trend: dict[str, int] = {}
-    for c in calls:
-        # CALL_LOG 没存时间戳，用近似：按顺序前 N 条近似最近
-        pass
-    fail_calls = [c for c in calls if c["status"] != 200][:10]
-    degraded_calls = [c for c in calls if c.get("degraded")][:10]
+        day = str(c.get("ts") or "")[:10] or "unknown"
+        d = trend.setdefault(day, {"calls": 0, "cost": 0.0, "tokens": 0, "cached": 0})
+        d["calls"] += 1
+        d["cost"] = round(d["cost"] + (c.get("cost") or 0), 6)
+        d["tokens"] += int(c.get("tokens_total") or 0)
+        d["cached"] += int(c.get("cached_tokens") or 0)
+        total_tokens += int(c.get("tokens_total") or 0)
+        total_cost += c.get("cost") or 0
+        total_cached += int(c.get("cached_tokens") or 0)
+        cached_savings += c.get("cached_savings") or 0
+        if c.get("cost"):
+            by_model_cost[m] = round(by_model_cost.get(m, 0) + c.get("cost", 0), 6)
+    cost_known = any(c.get("cost_known") for c in rows)
+    # 实时告警/明细仍用内存最近记录
+    live = list(CALL_LOG)
+    fail_calls = [c for c in live if c["status"] != 200][:10]
+    degraded_calls = [c for c in live if c.get("degraded")][:10]
     # 浪费告警：判档简单（c0/c1）却走了高档模型（可能是升级词误触/配置问题）
     waste_calls = [
-        c for c in calls
+        c for c in live
         if c["status"] == 200 and c.get("tier") in ("c0", "c1") and _is_high_end_model(c.get("model"))
     ][:10]
-    total_tokens = sum(c.get("tokens_total") or 0 for c in calls)
-    total_cost = sum(c.get("cost") or 0 for c in calls)
-    cost_known = any(c.get("cost_known") for c in calls)
-    # 费用按模型分布
-    by_model_cost: dict[str, float] = {}
-    for c in calls:
-        if c.get("cost"):
-            m = c.get("model") or "?"
-            by_model_cost[m] = round(by_model_cost.get(m, 0) + c.get("cost", 0), 6)
+    trend_sorted = [{"date": k, **v} for k, v in sorted(trend.items())]
     return {
-        "calls": calls[:50],
+        "period": period,
+        "calls": live[:50],
         "fail_calls": fail_calls,
         "degraded_calls": degraded_calls,
         "waste_calls": waste_calls,
@@ -807,8 +917,11 @@ async def admin_usage() -> dict:
             "degraded_count": len(degraded_calls),
             "waste_count": len(waste_calls),
             "total_tokens": total_tokens,
-            "total_cost": total_cost,
+            "total_cost": round(total_cost, 6),
             "cost_known": cost_known,
+            "total_cached_tokens": total_cached,
+            "cached_savings": round(cached_savings, 6),
+            "trend": trend_sorted,
         },
     }
 
@@ -871,6 +984,7 @@ async def admin_add_pool(body: dict) -> dict:
         "context_window": (body.get("context_window") or infer_context_window(body.get("model") or "") or ""),
         "price_in": float(body.get("price_in") or 0) if (body.get("price_in") not in (None, "")) else 0.0,
         "price_out": float(body.get("price_out") or 0) if (body.get("price_out") not in (None, "")) else 0.0,
+        "price_cached": float(body.get("price_cached") or 0) if (body.get("price_cached") not in (None, "")) else 0.0,
         "tiers": tiers,
         "priority": int(body.get("priority", 100) or 100),
         "enabled": bool(body.get("enabled", True)),
@@ -896,6 +1010,8 @@ async def admin_update_pool(model_id: str, body: dict) -> dict:
                 m["price_in"] = float(body.get("price_in") or 0) if (body.get("price_in") not in (None, "")) else 0.0
             if "price_out" in body:
                 m["price_out"] = float(body.get("price_out") or 0) if (body.get("price_out") not in (None, "")) else 0.0
+            if "price_cached" in body:
+                m["price_cached"] = float(body.get("price_cached") or 0) if (body.get("price_cached") not in (None, "")) else 0.0
             if "tiers" in body:
                 t = body.get("tiers") or []
                 if isinstance(t, str):
@@ -1597,6 +1713,7 @@ summary { cursor:pointer; color:var(--acc); font-size:13px; }
         <div><label>档位（逗号分隔）*</label><input id="f_tiers" placeholder="c0,c1"></div>
         <div><label>价格 入 ¥/M</label><input id="f_price_in" type="number" step="0.01" placeholder="如 1（每百万输入 token）"></div>
         <div><label>价格 出 ¥/M</label><input id="f_price_out" type="number" step="0.01" placeholder="如 2（每百万输出 token）"></div>
+        <div><label>价格 缓存 ¥/M</label><input id="f_price_cached" type="number" step="0.01" placeholder="如 0.1（缓存命中输入价，缺省=输入价）"></div>
         <div><label>优先级（小优先）</label><input id="f_priority" type="number" value="100"></div>
         <div><label>备注</label><input id="f_note" placeholder="可选"></div>
       </div>
@@ -1617,7 +1734,15 @@ summary { cursor:pointer; color:var(--acc); font-size:13px; }
     <div class="stat"><div class="stat-num" id="st_avg">—</div><div class="stat-label">平均耗时</div></div>
     <div class="stat"><div class="stat-num" id="st_p95">—</div><div class="stat-label">P95 耗时</div></div>
     <div class="stat"><div class="stat-num" id="st_tokens">0</div><div class="stat-label">总 Token</div></div>
+    <div class="stat"><div class="stat-num" id="st_cached">0</div><div class="stat-label">缓存命中 Token</div></div>
     <div class="stat"><div class="stat-num" id="st_cost">¥0</div><div class="stat-label">总费用</div></div>
+  </div>
+  <div class="tabs" id="rangeTabs">
+    <button class="tab active" data-r="today">今天</button>
+    <button class="tab" data-r="7d">7天</button>
+    <button class="tab" data-r="30d">30天</button>
+    <button class="tab" data-r="all">全部</button>
+    <span class="mut" id="rangeHint" style="margin-left:10px"></span>
   </div>
   <div class="dist-grid">
     <div><div class="dist-title">按模型</div><div class="dist-bars" id="dist_model"></div></div>
@@ -1894,6 +2019,7 @@ function formData(){
     priority: document.getElementById('f_priority').value,
     price_in: document.getElementById('f_price_in').value,
     price_out: document.getElementById('f_price_out').value,
+    price_cached: document.getElementById('f_price_cached').value,
     enabled: document.getElementById('f_enabled').checked,
     note: document.getElementById('f_note').value,
     provider_id: document.getElementById('f_provider').value,
@@ -1910,6 +2036,7 @@ function fillForm(m){
   document.getElementById('f_priority').value = m.priority||100;
   document.getElementById('f_price_in').value = m.price_in || '';
   document.getElementById('f_price_out').value = m.price_out || '';
+  document.getElementById('f_price_cached').value = m.price_cached || '';
   document.getElementById('f_enabled').checked = !!m.enabled;
   document.getElementById('f_note').value = m.note||'';
   document.getElementById('f_provider').value = m.provider_id || '';
@@ -1931,6 +2058,7 @@ function resetForm(){
   document.getElementById('f_priority').value='100';
   document.getElementById('f_price_in').value='';
   document.getElementById('f_price_out').value='';
+  document.getElementById('f_price_cached').value='';
   document.getElementById('f_enabled').checked=true;
   document.getElementById('btnSave').textContent='添加模型';
   document.getElementById('btnCancel').classList.add('hidden');
@@ -1990,6 +2118,7 @@ function fmtTokens(n){
   return String(n);
 }
 let USAGE_FILTER = 'all';
+let USAGE_RANGE = 'today';
 const pnameById = id => { const p = PROVIDERS.find(x=>x.id===id); return p ? p.name : (id||''); };
 function elapsedClass(s){
   if (s < 3) return '';
@@ -2010,14 +2139,16 @@ function renderDist(elId, dist, color){
 }
 async function refreshUsage(){
   try {
-    const u = await api('/admin/api/usage');
+    const u = await api('/admin/api/usage?period='+USAGE_RANGE);
     const s = u.stats;
     document.getElementById('st_total').textContent = s.total;
     document.getElementById('st_ok').textContent = s.total ? (s.ok_rate*100).toFixed(1)+'%' : '—';
     document.getElementById('st_avg').textContent = s.total ? s.avg_elapsed+'s' : '—';
     document.getElementById('st_p95').textContent = s.total ? s.p95_elapsed+'s' : '—';
     document.getElementById('st_tokens').textContent = s.total_tokens ? fmtTokens(s.total_tokens) : '0';
+    document.getElementById('st_cached').textContent = s.total_cached_tokens ? fmtTokens(s.total_cached_tokens) : '0';
     document.getElementById('st_cost').textContent = s.cost_known ? fmtCost(s.total_cost) : '—';
+    document.getElementById('rangeHint').textContent = (s.cached_savings>0 ? '缓存节省 ≈ '+fmtCost(s.cached_savings) : '');
     renderDist('dist_model', s.by_model, 'c-model');
     renderDist('dist_tier', s.by_tier, 'c-tier');
     renderDist('dist_provider', s.by_provider, 'c-provider');
@@ -2168,6 +2299,9 @@ document.getElementById('btnSlTrain').onclick = slTrain;
 document.getElementById('btnSlRefresh').onclick = refreshSlStatus;
 document.querySelectorAll('.tab').forEach(t=>{
   t.onclick = ()=>{ USAGE_FILTER = t.dataset.f; document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active')); t.classList.add('active'); refreshUsage(); };
+});
+document.querySelectorAll('#rangeTabs .tab').forEach(t=>{
+  t.onclick = ()=>{ USAGE_RANGE = t.dataset.r; document.querySelectorAll('#rangeTabs .tab').forEach(x=>x.classList.remove('active')); t.classList.add('active'); refreshUsage(); };
 });
 (async function init(){
   // 给每个卡片 h2 注入折叠按钮（记忆状态）
@@ -2459,17 +2593,7 @@ async def chat_completions(request: Request) -> Any:
                                 if usage:
                                     _entry = getattr(request.state, "call_entry", None)
                                     if _entry is not None:
-                                        tin = int(usage.get("prompt_tokens") or 0)
-                                        tout = int(usage.get("completion_tokens") or 0)
-                                        _entry["tokens_in"] = tin
-                                        _entry["tokens_out"] = tout
-                                        _entry["tokens_total"] = int(usage.get("total_tokens") or (tin + tout))
-                                        if selected_cfg is not None:
-                                            p_in = float(selected_cfg.get("price_in") or 0)
-                                            p_out = float(selected_cfg.get("price_out") or 0)
-                                            if p_in or p_out:
-                                                _entry["cost"] = round(tin / 1e6 * p_in + tout / 1e6 * p_out, 6)
-                                                _entry["cost_known"] = True
+                                        _apply_usage_to_entry(_entry, usage, selected_cfg)
                                     _usage_done = True
                                     break
                         except Exception:
@@ -2497,22 +2621,12 @@ async def chat_completions(request: Request) -> Any:
     _entry = getattr(request.state, "call_entry", None)
     if _entry is not None:
         usage = data.get("usage") or {}
-        tin = int(usage.get("prompt_tokens") or 0)
-        tout = int(usage.get("completion_tokens") or 0)
-        _entry["tokens_in"] = tin
-        _entry["tokens_out"] = tout
-        _entry["tokens_total"] = int(usage.get("total_tokens") or (tin + tout))
-        # 费用：模型池 price_in/price_out（¥/1M tokens）
-        if selected_cfg is not None:
-            p_in = float(selected_cfg.get("price_in") or 0)
-            p_out = float(selected_cfg.get("price_out") or 0)
-            if p_in or p_out:
-                _entry["cost"] = round(tin / 1e6 * p_in + tout / 1e6 * p_out, 6)
-                _entry["cost_known"] = True
+        _apply_usage_to_entry(_entry, usage, selected_cfg)
         route_info["usage"] = {
             "tokens_in": _entry["tokens_in"],
             "tokens_out": _entry["tokens_out"],
             "tokens_total": _entry["tokens_total"],
+            "cached_tokens": _entry["cached_tokens"],
             "cost": _entry["cost"],
             "cost_known": _entry["cost_known"],
         }

@@ -231,3 +231,24 @@
 - 训练链路 dry-run（合成 240 样本）：门控 READY → train_worker 子进程训练 → 评估；
   随机特征被拒（quality_regression + 隔离）✅；可学习特征 **promoted** → active 指针切
   `learned/<version>` + 收据 ✅（promotion 全链路验证）
+
+## [v5.3] 2026-08-21 费用统计升级：缓存命中 + 按日期持久化查询
+
+### 新增
+- **缓存命中统计**：解析 usage 缓存字段（兼容 DeepSeek `prompt_cache_hit_tokens` 与 OpenAI
+  `prompt_tokens_details.cached_tokens`），流式与非流式都生效
+- **费用分拆计费**：模型池新增可选 `price_cached`（缓存命中输入价 ¥/M）；
+  费用 = 未缓存输入×price_in + 缓存输入×price_cached + 输出×price_out；
+  未配缓存价时保守按输入价计费（不低估），并记录缓存节省金额 `cached_savings`
+- **调用记录按日期持久化**：`~/.opensquilla/router/data/tokensaver/calls-YYYY-MM-DD.jsonl`，
+  重启不丢；实时明细仍走内存最近记录
+- **按日期范围统计**：`GET /admin/api/usage?period=today|7d|30d|all`，返回
+  聚合 stats（调用/费用/Token/缓存命中/缓存节省）+ 每日趋势 trend + 各分布
+- **后台 UI**：统计卡新增「缓存命中 Token」「缓存节省」指标 + 时间范围切换（今天/7天/30天/全部）；
+  模型编辑表单新增「价格 缓存 ¥/M」输入框
+
+### 实测
+- 缓存解析：DeepSeek 格式/OpenAI 格式/无缓存 全部正确；配缓存价分拆计费 + 节省金额精确
+- 范围聚合：today/7d/30d/all + 趋势 + bogus 回退 today ✅
+- 实机：机缘上游返回 OpenAI 格式 `cached_tokens=0`（当前无缓存命中），解析器正常读取；
+  调用持久化落盘 ✅；**重启网关后 today 费用/Token 统计保留**（total 15 / cost 0.009702 / tokens 3430）✅
