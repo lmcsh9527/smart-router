@@ -88,7 +88,8 @@ curl -N http://localhost:20130/v1/chat/completions \
 | 快速发现模型 | 填 Base URL + Key → 获取模型 → 勾选批量入池（供应商自动保存） |
 | 模型池 | 测试（1+1 验证 / 生图验证）、编辑、删除、启用/禁用切换、优先级就地改 |
 | 供应商库 | 管理供应商（地址/Key 自动保存，下次直接选） |
-| 实时调用 | 统计卡 + 分布 + 失败/降级告警 + 明细过滤 |
+| 实时调用 | 统计卡 + 分布 + 失败/降级告警 + 明细过滤（每条可👍/👎纠错） |
+| 🧠 自学习 | 样本采集（只存特征向量）、纠错反馈、训练门控/一键训练、模型版本/上线状态 |
 
 ### 示例配置
 
@@ -124,6 +125,9 @@ cp models_pool.example.json models_pool.json      # 模型池模板
 | `GET/POST /admin/api/providers` | 供应商 CRUD |
 | `POST /admin/api/discover` | 发现模型（自动保存供应商） |
 | `GET /admin/api/usage` | 实时调用统计 |
+| `GET /admin/api/selflearning/status` | 自学习状态（样本数/门控/版本/训练任务） |
+| `POST /admin/api/selflearning/feedback` | 纠错反馈（up/down/neutral） |
+| `POST /admin/api/selflearning/train` | 触发一次训练（后台） |
 | `GET /admin/api/status` | 路由状态预览 |
 
 ## 📄 许可

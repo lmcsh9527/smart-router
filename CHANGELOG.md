@@ -191,3 +191,43 @@
 ### 实测（4 请求）
 - 简单 c1→flash / 复杂 c3→pro / 升级词 c3→pro / 流式 c0→flash
 - 总 token 207，总费用 ¥0.000793，waste=0 degraded=0 fail=0
+
+## [v5.1] 2026-08-21 一键接入 DSH
+
+### 新增
+- **「接入 DSH」设置卡片**（后台页面顶部）：一键把 DSH 默认模型设为 router9/auto（走智能路由），
+  或一键还原（deepseek-official 直连）
+- 后端：GET /admin/api/dsh/status（检测 router9 provider + 当前默认）、
+  POST /admin/api/dsh/setup {action: enable|disable}
+- 自动备份 DSH settings.yaml（.bak-tokensaver-时间戳）；记录原默认可还原
+- 发现：DSH 配置里 router9 provider 早已存在（指向 20130 + auto），
+  只是默认模型还是 deepseek-official 直连，所以智能路由此前未实际生效
+
+### 实测
+- enable → agent-default-model 变 router9/auto ✅
+- disable → 还原 deepseek-official/deepseek-v4-flash-0731 ✅
+- 注意：网关需以完整权限启动才能写 DSH 配置（~/Library/Application Support 受保护）
+
+## [v5.2] 2026-08-21 自学习闭环（采集/纠错/状态/训练）
+
+### 新增
+- **采集 hook**：classify 后自动构造训练样本（`build_train_sample` → `write_sample`），
+  只存 b64 特征向量（features_390 + raw_bge_1536），**不存原文**；
+  响应头带 `X-TokenSaver-Decision-Id / Session-Key / Turn-Index`，实时调用可溯源纠错
+- **自学习模块 vendor 化补齐**：`paths.py` 复制入 vendor（纯 stdlib），
+  `self_learning/`（含 store/train/train_worker/promotion/state/gates）脱离外部包可独立运行
+- **promotion 支持**：`get_strategy()` 解析 `~/.opensquilla/router/active` 指针加载 learned 模型；
+  注册 cache invalidator，训练 promote/rollback 后自动热切换（下次请求生效）
+- **管理 API**：`GET /admin/api/selflearning/status`（样本数/高价值/类别/门控/版本/训练任务）、
+  `POST /admin/api/selflearning/feedback`（up/down/neutral）、
+  `POST /admin/api/selflearning/train`（后台线程触发，门控≥200 高价值样本）
+- **后台页面**：🧠 自学习卡片（样本/高价值/纠错/门控/上次训练/模型版本）+ 实时调用每行纠错按钮
+- **PYTHONPATH 修复**：train_worker 子进程可看到 vendor 化 opensquilla（否则落到已装 0.5.3 缺 train_worker）
+- `.gitignore` 补拦 `sensenova_key` 等无后缀密钥文件
+
+### 实测
+- 采集 hook：正例写样本（只存 b64 向量/无原文）、反例（无特征/旁路路由）不写 ✅
+- 管理 API：status/feedback(up/down/neutral/非法400)/train 触发/kill-switch 禁用 ✅
+- 训练链路 dry-run（合成 240 样本）：门控 READY → train_worker 子进程训练 → 评估；
+  随机特征被拒（quality_regression + 隔离）✅；可学习特征 **promoted** → active 指针切
+  `learned/<version>` + 收据 ✅（promotion 全链路验证）

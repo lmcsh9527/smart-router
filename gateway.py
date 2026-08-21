@@ -28,9 +28,12 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import uuid
 from collections import deque
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -44,8 +47,24 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 _VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
 if _VENDOR_DIR not in sys.path:
     sys.path.insert(0, _VENDOR_DIR)
+# 子进程（train_worker）也要能看到 vendor 化 opensquilla：同步进 PYTHONPATH
+_pp = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
+if _VENDOR_DIR not in _pp:
+    os.environ["PYTHONPATH"] = os.pathsep.join([_VENDOR_DIR] + _pp)
 
-from opensquilla.squilla_router.v4_phase3 import V4Phase3Strategy
+from opensquilla.squilla_router.v4_phase3 import V4Phase3Strategy, default_bundle_dir
+from opensquilla.squilla_router.self_learning import hooks as self_learning_hooks
+from opensquilla.squilla_router.self_learning.capture import build_train_sample
+from opensquilla.squilla_router.self_learning.feedback import scan_feedback_stats, write_feedback
+from opensquilla.squilla_router.self_learning.gates import evaluate_training_gates
+from opensquilla.squilla_router.self_learning.orchestrator import maybe_run_update_router
+from opensquilla.squilla_router.self_learning.promotion import read_active, resolve_active_bundle_dir
+from opensquilla.squilla_router.self_learning.state import load_train_state, scan_event_store
+from opensquilla.squilla_router.self_learning.store import (
+    agent_data_dir,
+    self_learning_disabled_by_env,
+    write_sample,
+)
 
 # ---------- 配置（可用环境变量覆盖） ----------
 LISTEN_HOST = os.getenv("TOKENSAVER_HOST", "0.0.0.0")
@@ -173,6 +192,48 @@ def mask_key(key: str) -> str:
     if not key:
         return ""
     return f"{key[:4]}***{key[-6:]}"
+
+
+# ---------- DSH 接入（一键设置默认智能路由） ----------
+DSH_SETTINGS = os.path.expanduser("~/Library/Application Support/dsh-desktop/harness/settings.yaml")
+TOKENSAVER_PROVIDER = "router9"  # DSH 配置里指向本网关的 provider 名
+TOKENSAVER_MODEL = "auto"
+
+
+def _read_dsh_settings() -> dict:
+    try:
+        import yaml
+        with open(DSH_SETTINGS, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def _write_dsh_settings(data: dict) -> None:
+    import yaml
+    import shutil
+    if os.path.exists(DSH_SETTINGS):
+        shutil.copy2(DSH_SETTINGS, DSH_SETTINGS + f".bak-tokensaver-{time.strftime('%Y%m%d-%H%M%S')}")
+    with open(DSH_SETTINGS, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+
+def _dsh_status_info() -> dict:
+    data = _read_dsh_settings()
+    provs = (data.get("llm-pi-ai", {}) or {}).get("providers", {}) or {}
+    provider_ok = TOKENSAVER_PROVIDER in provs
+    am = data.get("agent-default-model", {}) or {}
+    default_provider = am.get("provider", "")
+    default_model = am.get("model", "")
+    enabled = provider_ok and default_provider == TOKENSAVER_PROVIDER and default_model == TOKENSAVER_MODEL
+    return {
+        "provider_configured": provider_ok,
+        "default_provider": default_provider,
+        "default_model": default_model,
+        "enabled": enabled,
+        "settings_path": DSH_SETTINGS,
+        "provider_name": TOKENSAVER_PROVIDER,
+    }
 
 
 def infer_model_type(model_id: str) -> str:
@@ -346,13 +407,37 @@ _strategy: V4Phase3Strategy | None = None
 _strategy_lock = asyncio.Lock()
 
 
+def _resolve_active_bundle_dir() -> str | None:
+    """自学习 promotion 切换后，优先加载 learned 模型包；异常回退 baseline。"""
+    try:
+        b = resolve_active_bundle_dir()
+        return str(b) if b is not None else None
+    except Exception as exc:
+        logger.warning("SELFLEARN resolve active bundle failed: %s", exc)
+        return None
+
+
+def _reset_strategy_cache() -> None:
+    global _strategy
+    _strategy = None
+    logger.info("SELFLEARN strategy cache invalidated (promotion/rollback)")
+
+
+# 训练 orchestrator 在 promote/rollback 后会调 hooks.invalidate_router_cache()
+self_learning_hooks.set_cache_invalidator(_reset_strategy_cache)
+
+
 async def get_strategy() -> V4Phase3Strategy:
     global _strategy
     if _strategy is None:
         async with _strategy_lock:
             if _strategy is None:
-                logger.info("loading V4Phase3Strategy ...")
-                _strategy = await asyncio.to_thread(V4Phase3Strategy)
+                bundle_dir = _resolve_active_bundle_dir()
+                logger.info("loading V4Phase3Strategy ... bundle=%s", bundle_dir or "baseline(default)")
+                if bundle_dir:
+                    _strategy = await asyncio.to_thread(V4Phase3Strategy, bundle_dir=bundle_dir)
+                else:
+                    _strategy = await asyncio.to_thread(V4Phase3Strategy)
                 logger.info(
                     "V4Phase3Strategy ready | bundle=%s available=%s version=%s",
                     _strategy.bundle_dir,
@@ -467,6 +552,70 @@ def last_user_text(messages: list[dict]) -> str:
     return ""
 
 
+def has_image_part(messages: list[dict]) -> bool:
+    """检测请求消息里是否含图片（OpenAI image_url 或 host image part）。"""
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for seg in content:
+                if isinstance(seg, dict) and seg.get("type") in ("image_url", "image", "input_image"):
+                    return True
+    return False
+
+
+# ---------- 自学习采集（只存特征向量，不存原文；best-effort 不阻塞主流程） ----------
+SELF_LEARN_AGENT_ID = "tokensaver"
+_session_turn_counters: dict[str, int] = {}
+
+
+def _next_turn_index(session_key: str) -> int:
+    n = _session_turn_counters.get(session_key, 0)
+    _session_turn_counters[session_key] = n + 1
+    return n
+
+
+def _capture_train_sample(
+    *,
+    decision_id: str,
+    session_key: str,
+    tier: str,
+    confidence: float,
+    source: str,
+    extra: dict,
+    turn_index: int,
+) -> bool:
+    """classify 后采集一条训练样本；任何异常只记日志，绝不影响路由主流程。"""
+    try:
+        if self_learning_disabled_by_env():
+            return False
+        features = (extra or {}).get("_train_features")
+        if not isinstance(features, dict) or features.get("features_390") is None:
+            return False
+        metadata = {
+            "routing_train_features": features,
+            "routing_source": source,
+            "routing_extra": extra,
+            "routed_tier": tier,
+            "routing_confidence": confidence,
+            "routing_train_turn_index": turn_index,
+            "router_decision_id": decision_id,
+        }
+        sample = build_train_sample(session_key=session_key, metadata=metadata)
+        if sample is None:
+            return False
+        path = write_sample(sample, SELF_LEARN_AGENT_ID)
+        logger.info(
+            "SELFLEARN captured decision_id=%s session=%s tier=%s source=%s schema=%s path=%s",
+            decision_id, session_key, tier, source, sample.feature_schema_version, path,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("SELFLEARN capture failed (best-effort): %s", exc)
+        return False
+
+
 def _parse_upstream_json(text: str) -> dict | None:
     """解析上游 JSON。
 
@@ -553,6 +702,9 @@ async def log_calls_middleware(request: Request, call_next):
         "source": "",
         "provider": "",
         "degraded": False,
+        "decision_id": "",
+        "session_key": "",
+        "turn_index": 0,
         "text": text,
         "tokens_in": 0,
         "tokens_out": 0,
@@ -570,6 +722,9 @@ async def log_calls_middleware(request: Request, call_next):
     entry["source"] = response.headers.get("X-TokenSaver-Source", "")
     entry["provider"] = response.headers.get("X-TokenSaver-Provider", "")
     entry["degraded"] = response.headers.get("X-TokenSaver-Degraded", "") == "1"
+    entry["decision_id"] = response.headers.get("X-TokenSaver-Decision-Id", "")
+    entry["session_key"] = response.headers.get("X-TokenSaver-Session-Key", "")
+    entry["turn_index"] = int(response.headers.get("X-TokenSaver-Turn-Index", "0") or 0)
     CALL_LOG.appendleft(entry)
     return response
     return response
@@ -1068,6 +1223,204 @@ def _host_of(base_url: str) -> str:
         return base_url
 
 
+
+
+@app.get("/admin/api/dsh/status")
+async def admin_dsh_status() -> dict:
+    return _dsh_status_info()
+
+
+@app.post("/admin/api/dsh/setup")
+async def admin_dsh_setup(body: dict) -> dict:
+    """一键接入/断开 DSH：action = enable（设 router9/auto 为默认）| disable（还原）。"""
+    action = (body or {}).get("action", "enable")
+    data = _read_dsh_settings()
+    if not data:
+        return JSONResponse(status_code=500, content={"error": f"无法读取 DSH 配置：{DSH_SETTINGS}"})
+
+    pi = data.setdefault("llm-pi-ai", {})
+    provs = pi.setdefault("providers", {})
+    if TOKENSAVER_PROVIDER not in provs:
+        provs[TOKENSAVER_PROVIDER] = {
+            "api": "openai-completions",
+            "apiKeyEnv": "ROUTER9_API_KEY",
+            "baseURL": "http://localhost:20130/v1",
+            "displayName": "TokenSaver 智能路由",
+            "models": [
+                {"id": "auto", "contextWindow": 1000000},
+                {"id": "deepseek-v4-flash", "contextWindow": 1000000},
+                {"id": "deepseek-v4-pro", "contextWindow": 1000000},
+                {"id": "deepseek-v4-flash-0731", "contextWindow": 1000000},
+            ],
+        }
+
+    am = data.setdefault("agent-default-model", {})
+    if action == "disable":
+        prev = (data.get("_tokensaver_prev_default") or {})
+        am["provider"] = prev.get("provider", "deepseek-official")
+        am["model"] = prev.get("model", "deepseek-v4-flash-0731")
+        data.pop("_tokensaver_prev_default", None)
+    else:
+        if not data.get("_tokensaver_prev_default"):
+            data["_tokensaver_prev_default"] = {"provider": am.get("provider"), "model": am.get("model")}
+        am["provider"] = TOKENSAVER_PROVIDER
+        am["model"] = TOKENSAVER_MODEL
+        am.pop("reasoningEffort", None)
+
+    try:
+        _write_dsh_settings(data)
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": f"写入 DSH 配置失败：{exc}"})
+
+    logger.info("ADMIN dsh setup action=%s -> provider=%s model=%s", action, am.get("provider"), am.get("model"))
+    return {"ok": True, "action": action, "status": _dsh_status_info()}
+
+
+# ---------- 自学习管理（状态/纠错/训练） ----------
+SELF_LEARN_MIN_SAMPLES = int(os.getenv("TOKENSAVER_SELFLEARN_MIN_SAMPLES", "200"))
+_train_job: dict[str, Any] = {"running": False, "started_at": None, "finished_at": None, "result": None, "error": None}
+
+
+def _self_learning_config() -> SimpleNamespace:
+    """网关侧自学习旋钮：手动触发训练不卡 idle/cooldown，尊重样本量门控。"""
+    return SimpleNamespace(
+        enabled=True,
+        train_min_samples=SELF_LEARN_MIN_SAMPLES,
+        idle_hours=0.0,
+        cooldown_hours=0.0,
+        retention_days=30,
+        min_feedback_monitor_samples=5,
+        num_boost_round=60,
+        learning_rate=0.05,
+        train_timeout_seconds=900,
+        golden_eval_path=None,
+        cost_tolerance_pct=5.0,
+        max_critical_under_routing=0.30,
+        holdout_min_size=30,
+        min_golden_agreement=0.5,
+    )
+
+
+def _train_job_result_payload(result: Any) -> dict:
+    return {
+        "ran": bool(getattr(result, "ran", False)),
+        "reason": str(getattr(result, "reason", "") or ""),
+        "version": getattr(result, "version", None),
+        "promoted": bool(getattr(result, "promoted", False)),
+        "gate_reason": getattr(result, "gate_reason", None),
+        "error": getattr(result, "error", None),
+    }
+
+
+def _run_train_job() -> None:
+    global _train_job
+    try:
+        base_dir = _resolve_active_bundle_dir() or str(default_bundle_dir())
+        router_cfg = SimpleNamespace(self_learning=_self_learning_config())
+        result = maybe_run_update_router(
+            SELF_LEARN_AGENT_ID,
+            router_cfg=router_cfg,
+            base_dir=base_dir,
+        )
+        _train_job = {
+            "running": False,
+            "started_at": _train_job.get("started_at"),
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "result": _train_job_result_payload(result),
+            "error": None,
+        }
+        logger.info("SELFLEARN train job done: %s", _train_job["result"])
+    except Exception as exc:
+        logger.warning("SELFLEARN train job failed: %s", exc)
+        _train_job = {
+            "running": False,
+            "started_at": _train_job.get("started_at"),
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "result": None,
+            "error": str(exc),
+        }
+
+
+@app.get("/admin/api/selflearning/status")
+async def admin_selflearning_status() -> dict:
+    stats = scan_event_store(SELF_LEARN_AGENT_ID)
+    state = load_train_state(SELF_LEARN_AGENT_ID)
+    cfg = _self_learning_config()
+    gate = evaluate_training_gates(config=cfg, state=state, stats=stats)
+    try:
+        fb = scan_feedback_stats(SELF_LEARN_AGENT_ID)
+        fb_dict = {"total": fb.total, "up": fb.up, "down": fb.down, "total_single": fb.total_single, "down_single": fb.down_single, "downvote_rate": round(fb.downvote_rate, 4)}
+    except Exception:
+        fb_dict = {}
+    return {
+        "agent_id": SELF_LEARN_AGENT_ID,
+        "data_root": str(agent_data_dir(SELF_LEARN_AGENT_ID)),
+        "kill_switch": self_learning_disabled_by_env(),
+        "active_pointer": read_active(),
+        "stats": {
+            "total": stats.total,
+            "high_value": stats.high_value,
+            "complaints": stats.complaints,
+            "distinct_classes": stats.distinct_classes,
+            "last_ts": stats.last_ts,
+            "dominant_schema_version": stats.dominant_schema_version,
+        },
+        "state": state.to_json(),
+        "feedback": fb_dict,
+        "gate": {
+            "should_train": gate.should_train,
+            "reason": gate.reason,
+            "effective_min_samples": gate.effective_min_samples,
+            "detail": gate.stats,
+        },
+        "train_job": _train_job,
+    }
+
+
+@app.post("/admin/api/selflearning/feedback")
+async def admin_selflearning_feedback(body: dict) -> dict:
+    rating = str((body or {}).get("rating") or "").strip()
+    decision_id = str((body or {}).get("decision_id") or "").strip()
+    if rating not in ("up", "down", "neutral"):
+        return JSONResponse(status_code=400, content={"error": "rating 必须是 up/down/neutral"})
+    if not decision_id:
+        return JSONResponse(status_code=400, content={"error": "缺少 decision_id"})
+    session_key = str((body or {}).get("session_key") or "default").strip() or "default"
+    try:
+        turn_index = int((body or {}).get("turn_index") or 0)
+    except (TypeError, ValueError):
+        turn_index = 0
+    try:
+        path = write_feedback(
+            SELF_LEARN_AGENT_ID,
+            decision_id=decision_id,
+            session_key=session_key,
+            turn_index=turn_index,
+            rating=rating,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    logger.info("SELFLEARN feedback rating=%s decision=%s session=%s turn=%s", rating, decision_id, session_key, turn_index)
+    return {"ok": True, "path": str(path)}
+
+
+@app.post("/admin/api/selflearning/train")
+async def admin_selflearning_train() -> dict:
+    if self_learning_disabled_by_env():
+        return JSONResponse(status_code=400, content={"error": "自学习已被环境变量禁用"})
+    if _train_job.get("running"):
+        return JSONResponse(status_code=409, content={"error": "训练已在运行中"})
+    _train_job.update({
+        "running": True,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "finished_at": None,
+        "result": None,
+        "error": None,
+    })
+    threading.Thread(target=_run_train_job, daemon=True).start()
+    return {"ok": True, "started": True}
+
+
 @app.get("/admin/api/status")
 async def admin_status() -> dict:
     strategy = await get_strategy()
@@ -1186,6 +1539,26 @@ summary { cursor:pointer; color:var(--acc); font-size:13px; }
   <div class="row" id="tierPreview"></div>
 </div>
 
+<div class="card" id="dshCard">
+  <h2 style="margin-top:0">🤖 接入 DSH（一键设置）</h2>
+  <div id="dshStatus" class="mut">检测中…</div>
+  <div class="row" style="margin-top:10px">
+    <button id="btnDshEnable">设为默认智能路由</button>
+    <button id="btnDshDisable" class="ghost">还原默认</button>
+    <span class="mut" id="dshHint"></span>
+  </div>
+</div>
+
+<div class="card" id="slCard">
+  <h2 style="margin-top:0">🧠 自学习</h2>
+  <div id="slStatus" class="mut">加载中…</div>
+  <div class="row" style="margin-top:10px">
+    <button id="btnSlTrain">立即训练</button>
+    <button id="btnSlRefresh" class="ghost">刷新</button>
+    <span class="mut" id="slHint"></span>
+  </div>
+</div>
+
 <div class="card">
   <h2 style="margin-top:0">快速发现模型</h2>
   <p class="mut">选已有供应商，或填新 Base URL + Key → 点「获取模型」自动拉取模型列表；供应商信息会自动保存，下次直接选。</p>
@@ -1255,8 +1628,8 @@ summary { cursor:pointer; color:var(--acc); font-size:13px; }
     <button class="tab" data-f="slow">🐢 慢&gt;10s</button>
   </div>
   <table><thead><tr>
-    <th>时间</th><th>状态</th><th>耗时</th><th>档位</th><th>供应商</th><th>模型</th><th>Token 入/出</th><th>费用</th><th>请求摘要</th>
-  </tr></thead><tbody id="usageBody"><tr><td colspan="9" class="mut">暂无调用，发一个请求试试</td></tr></tbody></table>
+    <th>时间</th><th>状态</th><th>耗时</th><th>档位</th><th>供应商</th><th>模型</th><th>Token 入/出</th><th>费用</th><th>请求摘要</th><th>纠错</th>
+  </tr></thead><tbody id="usageBody"><tr><td colspan="10" class="mut">暂无调用，发一个请求试试</td></tr></tbody></table>
 </div>
 
 <div class="card">
@@ -1690,10 +2063,74 @@ async function refreshUsage(){
       <td class="mut">${fmtTokens(c.tokens_in)}/${fmtTokens(c.tokens_out)}</td>
       <td>${c.cost_known?fmtCost(c.cost):'<span class="mut">—</span>'}</td>
       <td class="mut" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c.text||'')}">${esc(c.text||'—')}</td>
-    </tr>`).join('') || '<tr><td colspan="9" class="mut">当前筛选无记录</td></tr>';
+      <td>${c.decision_id?`<span class="fb-btns" data-dec="${esc(c.decision_id)}" data-sess="${esc(c.session_key||'')}" data-turn="${c.turn_index||0}"><button class="fb-up" title="路由正确">👍</button><button class="fb-down" title="路由错误">👎</button><button class="fb-neutral" title="撤销纠错">↩️</button></span>`:'<span class="mut">—</span>'}</td>
+    </tr>`).join('') || '<tr><td colspan="10" class="mut">当前筛选无记录</td></tr>';
+    tb.querySelectorAll('.fb-btns').forEach(span=>{
+      const dec = span.dataset.dec, sess = span.dataset.sess, turn = span.dataset.turn;
+      span.querySelector('.fb-up').onclick = ()=>sendFeedback(dec, sess, turn, 'up', span);
+      span.querySelector('.fb-down').onclick = ()=>sendFeedback(dec, sess, turn, 'down', span);
+      span.querySelector('.fb-neutral').onclick = ()=>sendFeedback(dec, sess, turn, 'neutral', span);
+    });
   } catch(e){ /* 静默，下次再刷 */ }
 }
 
+async function refreshDshStatus(){
+  try {
+    const s = await api('/admin/api/dsh/status');
+    const el = document.getElementById('dshStatus');
+    el.innerHTML = s.enabled
+      ? `✅ 已接入：DSH 默认模型 = <b>${esc(s.provider_name)}/auto</b>（智能路由生效中）<br><span class="mut">配置：${esc(s.settings_path)}</span>`
+      : `ℹ️ 未接入：DSH 默认模型 = <b>${esc(s.default_provider)}/${esc(s.default_model)}</b>（直连，不走智能路由）<br><span class="mut">router9 provider ${s.provider_configured?'已配置':'未配置'} · ${esc(s.settings_path)}</span>`;
+    document.getElementById('dshHint').textContent = '改完后需重启 DSH 生效';
+  } catch(e){ document.getElementById('dshStatus').textContent = '状态获取失败：'+e.message; }
+}
+async function dshSetup(action){
+  try {
+    const r = await api('/admin/api/dsh/setup', {method:'POST', body:JSON.stringify({action})});
+    document.getElementById('dshHint').textContent = (r.ok?'✅ 已保存，请重启 DSH 生效':'❌ 失败') + (r.status&&r.status.enabled?'（当前：智能路由）':'（当前：直连）');
+    await refreshDshStatus();
+  } catch(e){ alert('设置失败: '+e.message); }
+}
+async function refreshSlStatus(){
+  try {
+    const s = await api('/admin/api/selflearning/status');
+    const g = s.gate||{}, st = s.stats||{}, stt = s.state||{}, fb = s.feedback||{}, job = s.train_job||{};
+    let jobHtml = '';
+    if (job.running) jobHtml = '<div class="alert alert-warn"><b>⏳ 训练中…</b> 开始于 '+esc(job.started_at||'')+'（后台进行，网关不受影响）</div>';
+    else if (job.error) jobHtml = '<div class="alert alert-fail"><b>❌ 训练失败：</b>'+esc(job.error)+'</div>';
+    else if (job.result && job.result.ran) jobHtml = '<div class="alert alert-warn"><b>✅ 训练完成：</b>'+esc(job.result.reason||'')+(job.result.version?' · 版本 '+esc(job.result.version):'')+(job.result.promoted?' · 已上线':'')+'</div>';
+    const el = document.getElementById('slStatus');
+    el.innerHTML = jobHtml +
+      '<div class="stat-grid" style="grid-template-columns:repeat(4,1fr)">'
+      +'<div class="stat"><div class="stat-num">'+(st.total||0)+'</div><div class="stat-label">样本数</div></div>'
+      +'<div class="stat"><div class="stat-num">'+(st.high_value||0)+'</div><div class="stat-label">高价值</div></div>'
+      +'<div class="stat"><div class="stat-num">'+(st.distinct_classes||0)+'</div><div class="stat-label">类别</div></div>'
+      +'<div class="stat"><div class="stat-num">'+(fb.down||0)+'/'+(fb.total||0)+'</div><div class="stat-label">纠错↓/总</div></div>'
+      +'</div>'
+      +'<div class="row mut" style="margin-top:8px">'
+      +'<span>门控：'+(g.should_train?'<b class="ok">可训练</b>':'<b>'+esc(g.reason||'')+'</b>')+'（有效阈值 '+(g.effective_min_samples||200)+'）</span>'
+      +'<span style="margin-left:14px">上次训练：'+esc(stt.last_train_ts||'从未')+'</span>'
+      +'<span style="margin-left:14px">模型版本：'+esc(s.active_pointer||'baseline')+(stt.active_version?'（learned '+esc(stt.active_version)+'）':'')+'</span>'
+      +'</div>'
+      +'<div class="mut" style="margin-top:6px;font-size:12px">数据目录：'+esc(s.data_root||'')+'</div>';
+    document.getElementById('slHint').textContent = s.kill_switch ? '⚠️ 环境变量已禁用自学习' : '';
+    document.getElementById('btnSlTrain').disabled = !!job.running || !!s.kill_switch;
+  } catch(e){ document.getElementById('slStatus').textContent = '状态获取失败：'+e.message; }
+}
+async function sendFeedback(decisionId, sessionKey, turnIndex, rating, btnEl){
+  try {
+    const r = await api('/admin/api/selflearning/feedback', {method:'POST', body:JSON.stringify({decision_id:decisionId, session_key:sessionKey, turn_index:parseInt(turnIndex||0,10), rating})});
+    if (btnEl) btnEl.innerHTML = '<span class="tag">✓已记录</span>';
+    if (r && r.ok) await refreshUsage();
+  } catch(e){ alert('纠错失败: '+e.message); }
+}
+async function slTrain(){
+  try {
+    const r = await api('/admin/api/selflearning/train', {method:'POST', body:'{}'});
+    document.getElementById('slHint').textContent = r.ok ? '⏳ 已触发训练，请稍候刷新状态' : ('❌ '+(r.error||'触发失败'));
+    await refreshSlStatus();
+  } catch(e){ alert('触发训练失败: '+e.message); }
+}
 let poolCache = [];
 function editProvider(id){
   const p = PROVIDERS.find(x=>x.id===id);
@@ -1719,6 +2156,10 @@ document.getElementById('btnSave').onclick = save;
 document.getElementById('btnCancel').onclick = resetForm;
 document.getElementById('btnDiscover').onclick = discover;
 document.getElementById('btnAddSelected').onclick = addSelected;
+document.getElementById('btnDshEnable').onclick = () => dshSetup('enable');
+document.getElementById('btnDshDisable').onclick = () => dshSetup('disable');
+document.getElementById('btnSlTrain').onclick = slTrain;
+document.getElementById('btnSlRefresh').onclick = refreshSlStatus;
 document.querySelectorAll('.tab').forEach(t=>{
   t.onclick = ()=>{ USAGE_FILTER = t.dataset.f; document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active')); t.classList.add('active'); refreshUsage(); };
 });
@@ -1746,8 +2187,9 @@ document.querySelectorAll('.tab').forEach(t=>{
     applyState();
   });
   try { poolCache = (await api('/admin/api/pool')).models; } catch(e){}
-  await refreshProviders(); await refreshPool(); await refreshStatus(); await refreshUsage();
+  await refreshProviders(); await refreshPool(); await refreshStatus(); await refreshUsage(); await refreshDshStatus(); await refreshSlStatus();
   setInterval(refreshUsage, 3000);  // 实时调用每 3 秒刷新
+  setInterval(refreshSlStatus, 5000);  // 自学习状态每 5 秒刷新
 })();
 </script>
 </body>
@@ -1770,7 +2212,29 @@ async def chat_completions(request: Request) -> Any:
     text = last_user_text(messages)
 
     # ---- 路由决策 ----
-    if client_model.lower() in AUTO_MODEL_TOKENS:
+    if has_image_part(messages):
+        # 图片请求：直接路由日日新视觉模型（免费至 2026-08-31），不走复杂度判档
+        tier = "img"
+        upstream_model, selected_cfg = pick_model_from_pool(tier)
+        if upstream_model is None:
+            upstream_model = "sensenova-6.8-flash-lite"
+            selected_cfg = None
+        route_info = {
+            "tier": tier,
+            "confidence": 1.0,
+            "source": "image-vlm",
+            "route_class": "IMG",
+            "difficulty": 0.0,
+            "upstream_model": upstream_model,
+        }
+        logger.info(
+            "ROUTE(image) client_model=%s upstream_model=%s",
+            client_model, upstream_model,
+        )
+    elif client_model.lower() in AUTO_MODEL_TOKENS:
+        decision_id = uuid.uuid4().hex
+        session_key = str(request.headers.get("x-session-key", "") or "").strip() or "default"
+        turn_index = _next_turn_index(session_key)
         llm_tier: str | None = None
         llm_task: dict = {}
         if LLM_CLASSIFIER_ENABLED:
@@ -1818,6 +2282,16 @@ async def chat_completions(request: Request) -> Any:
                 tier, confidence, source, extra = DEFAULT_TIER, 0.0, "empty", {}
             # 升级词检测：用户明示要最强/最好模型时，强制走最高档（尊重用户意图）
             tier = _apply_upgrade_hint(text, tier)
+            # 自学习采集：只存特征向量（_train_features），不存原文；best-effort
+            _capture_train_sample(
+                decision_id=decision_id,
+                session_key=session_key,
+                tier=tier,
+                confidence=float(confidence),
+                source=source,
+                extra=extra,
+                turn_index=turn_index,
+            )
             upstream_model, selected_cfg = pick_model_from_pool(tier)
             if upstream_model is None:
                 upstream_model = TIER_MODEL_MAP.get(tier, TIER_MODEL_MAP[DEFAULT_TIER])
@@ -1836,6 +2310,9 @@ async def chat_completions(request: Request) -> Any:
                 extra.get("route_class"), extra.get("difficulty"),
                 upstream_model, text[:80],
             )
+        route_info["decision_id"] = decision_id
+        route_info["session_key"] = session_key
+        route_info["turn_index"] = turn_index
     else:
         # 客户端显式指定模型：优先查池（匹配 model 名），否则走全局直连
         upstream_model = client_model
@@ -1852,7 +2329,15 @@ async def chat_completions(request: Request) -> Any:
     payload = dict(body)
 
     # 流式一旦开始输出就不能降级（只能透传），故流式只尝试首选模型
-    upstream_chain = build_upstream_chain(tier, upstream_model, selected_cfg, stream)
+    if tier == "img" and selected_cfg is not None:
+        # 图片请求：只走视觉模型单链，不降级到文本模型
+        upstream_chain = [(
+            (selected_cfg.get("base_url") or UPSTREAM_BASE).rstrip("/"),
+            resolve_model_key(selected_cfg),
+            upstream_model,
+        )]
+    else:
+        upstream_chain = build_upstream_chain(tier, upstream_model, selected_cfg, stream)
 
     last_err: str | None = None
     last_status: int | None = None
@@ -1929,6 +2414,9 @@ async def chat_completions(request: Request) -> Any:
         "X-TokenSaver-Tier": str(route_info.get("tier", "")),
         "X-TokenSaver-Upstream-Model": used_model,
         "X-TokenSaver-Source": str(route_info.get("source", route_info.get("mode", ""))),
+        "X-TokenSaver-Decision-Id": str(route_info.get("decision_id", "")),
+        "X-TokenSaver-Session-Key": str(route_info.get("session_key", "")),
+        "X-TokenSaver-Turn-Index": str(route_info.get("turn_index", 0)),
     }
 
     # 降级发生时更新路由元数据，如实反映最终实际使用的模型
